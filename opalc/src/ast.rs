@@ -13,6 +13,7 @@ pub enum TypeDecl {
     /// (type MyType ( (field ~ Type) ... ))
     Record {
         name: String,
+        params: Vec<String>,           // ["e", "a"]
         fields: Vec<(String, String)>, // (Field Name, Type Name)
         span: Range<usize>,
     },

@@ -8,6 +8,7 @@ use crate::{
     lexer::{Token, TokenKind},
     sexpr::SExpr,
 };
+use core::panic;
 use std::ops::Range;
 
 pub struct Lowerer {
@@ -31,92 +32,119 @@ impl Lowerer {
         items: &[SExpr],
         span: Range<usize>,
     ) -> Result<TypeDecl, ()> {
-        let mut cursor = 1; // Skip "type"
+        let mut cursor = 1; // Skip the "type" atom
 
-        // 1. Check for Generics: ['e 'a]
+        // 1. Parse optional generics: ['t] or ['e 'a]
         let mut params = Vec::new();
         if let Some(SExpr::Square(gen_items, _)) = items.get(cursor) {
             for s in gen_items {
                 if let SExpr::Atom(t) = s {
-                    // We expect TokenKind::Generic here (the 'a syntax)
                     params.push(self.source_at(file_id, t.span.clone()).to_string());
                 }
             }
             cursor += 1;
         }
 
-        // 2. Get the Type Name (e.g., MyType or Result)
-        let name_sexpr = items.get(cursor).ok_or_else(|| {
-            self.error(Diagnostic {
-                severity: Severity::Error,
-                code: Some("E006".to_string()),
-                message: "Type Declaration missing a name".to_string(),
-                labels: vec![Label {
-                    style: LabelStyle::Primary,
-                    file_id,
-                    range: span.to_owned(),
-                    message: "".to_string(),
-                }],
-                notes: vec![],
-            });
-        })?;
-        let name = match name_sexpr {
-            SExpr::Atom(t) => self.source_at(file_id, t.span.clone()).to_string(),
-            _ => return Err(()), // Error: Name must be an identifier
+        // 2. Get Type Name: MyType, MyGenericType, Result, etc.
+        let name = match items.get(cursor) {
+            Some(SExpr::Atom(t)) => self.source_at(file_id, t.span.clone()).to_string(),
+            _ => return Err(()), // Error: Missing type name
         };
-
         cursor += 1;
 
-        // 3. Parse the Body (Fields or Constructors)
-        let mut fields = Vec::new();
-        let mut constructors = Vec::new();
+        // 3. Peak at the first item in the body to determine the Kind
+        // We expect a list like (:field ~ Type) or (Constructor ~ Type)
+        let body_items = &items[cursor..];
+        let first_body_item = body_items.first().ok_or(())?;
 
-        for item in &items[cursor..] {
-            if let SExpr::Round(parts, _) = item {
-                for part in parts {
-                    let SExpr::Round(field_or_constructor, span) = part else {
-                        todo!("need to return error here as a type should always have a body");
-                    };
-                    let item_name = match field_or_constructor.first() {
-                        Some(SExpr::Atom(t)) => self.source_at(file_id, t.span.clone()).to_string(),
-                        _ => continue,
-                    };
-
-                    // Expected shape: (Name ~ Type) or (Name)
-                    let item_type = if field_or_constructor.len() >= 3 {
-                        match field_or_constructor.get(2) {
-                            Some(SExpr::Atom(t)) => {
-                                Some(self.source_at(file_id, t.span.clone()).to_string())
-                            }
-                            _ => None,
-                        }
+        // Determine if we are building a Record or a Variant based on the first token
+        let is_record = if let SExpr::Round(inner, _) = first_body_item {
+            // Look at the very first thing inside the first definition
+            match inner.first() {
+                Some(SExpr::Round(nested_inner, _)) => {
+                    if let Some(SExpr::Atom(t)) = nested_inner.first() {
+                        matches!(t.kind, TokenKind::NamedField(_))
                     } else {
-                        None
-                    };
+                        false
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
 
-                    // Heuristic: If we have params, it's a Variant. If not, it's a Record.
-                    if !params.is_empty() {
-                        constructors.push((item_name, item_type));
-                    } else {
-                        // For records, the type is required: (field_one ~ String)
-                        if let Some(t_name) = item_type {
-                            fields.push((item_name, t_name));
-                        }
+        if is_record {
+            // --- Lowering as a Record (Product Type) ---
+            let mut fields = Vec::new();
+            for item in body_items {
+                if let SExpr::Round(inner, _) = item {
+                    for i in inner {
+                        let SExpr::Round(inner, _) = i else {
+                            panic!("missing round brackets");
+                        };
+                        let SExpr::Atom(name_token) = &inner[0] else {
+                            panic!()
+                        };
+                        let TokenKind::NamedField(field_name) = &name_token.kind else {
+                            panic!()
+                        };
+
+                        let SExpr::Atom(tilde_token) = &inner[1] else {
+                            panic!()
+                        };
+
+                        let TokenKind::Tilde = &tilde_token.kind else {
+                            panic!("missing tilde")
+                        };
+
+                        let SExpr::Atom(field_type) = &inner[2] else {
+                            panic!()
+                        };
+
+                        // let Some(SExpr::Round(exprs, ))= inner[0];
+                        // Expect: (:field_name ~ TypeName)
+                        let field_type = self
+                            .source_at(file_id, field_type.span.to_owned())
+                            .to_string();
+                        fields.push((field_name.clone(), field_type));
                     }
                 }
             }
-        }
-
-        // 4. Return the correct variant
-        if !params.is_empty() {
+            Ok(TypeDecl::Record {
+                name,
+                params,
+                fields,
+                span,
+            })
+        } else {
+            // --- Lowering as a Variant (Sum Type) ---
+            let mut constructors = Vec::new();
+            let Some(SExpr::Round(body_items, span)) = body_items.first() else {
+                panic!("fuck this should be a round ")
+            };
+            for item in body_items {
+                match item {
+                    // Case: (Some ~ 'a) or (Error ~ 'e)
+                    SExpr::Round(inner, _) => {
+                        let c_name = self.source_at(file_id, inner[0].span()).to_string();
+                        let c_type = Some(self.source_at(file_id, inner[2].span()).to_string());
+                        constructors.push((c_name, c_type));
+                    }
+                    // Case: None (Constant constructor with no payload)
+                    SExpr::Atom(t) => {
+                        let c_name = self.source_at(file_id, t.span.clone()).to_string();
+                        constructors.push((c_name, None));
+                    }
+                    _ => continue,
+                }
+            }
             Ok(TypeDecl::Variant {
                 name,
                 params,
                 constructors,
-                span,
+                span: span.to_owned(),
             })
-        } else {
-            Ok(TypeDecl::Record { name, fields, span })
         }
     }
 
@@ -603,6 +631,9 @@ impl Lowerer {
 #[cfg(test)]
 mod tests {
 
+    use core::panic;
+    use std::env::set_current_dir;
+
     use super::*;
 
     // Helper to setup the lowerer with a string
@@ -631,8 +662,21 @@ mod tests {
                         (Some ~ 'a)))
                     "#,
         );
-        let exprs = lowerer.lower_file(file_id, &sexprs);
 
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+    }
+
+    #[test]
+    fn test_record_type_with_generics() {
+        let (mut lowerer, file_id, sexprs) = setup(
+            "
+                (type ['t] MyGenericType (
+                    (:name ~ String)
+                    (:data ~ 't)
+                ))",
+        );
+
+        let exprs = lowerer.lower_file(file_id, &sexprs);
         dbg!(exprs);
         panic!();
     }
@@ -641,12 +685,26 @@ mod tests {
     fn test_record_type() {
         let (mut lowerer, file_id, sexprs) = setup(
             "(type MyType (
-                        (field_one ~ String)
-                        (field_two ~ Int)
-                        (field_three ~ Bool)
+                        (:field_one ~ String)
+                        (:field_two ~ Int)
+                        (:field_three ~ Bool)
                         ))",
         );
+
         let exprs = lowerer.lower_file(file_id, &sexprs);
+        if let Declaration::Type(TypeDecl::Record {
+            name,
+            params,
+            fields,
+            span,
+        }) = &exprs[0]
+        {
+            assert_eq!(name, "MyType");
+            assert_eq!(*params, Vec::<String>::new());
+            panic!()
+        } else {
+            panic!("expected a type not an expression")
+        }
     }
 
     #[test]

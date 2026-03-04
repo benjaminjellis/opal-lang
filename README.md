@@ -4,14 +4,20 @@ Opal is an experimental lisp-ish language with ml-ish semantics.
 Below is a sample program
 
 ```
-;; custom record type
+;; custom record / products types
 (type MyType (
-  (field_one ~ String)
-  (field_two ~ Int)
-  (field_three ~ Bool)
+  (:field_one ~ String)
+  (:field_two ~ Int)
+  (:field_three ~ Bool)
 ))
 
-;; custom variant types
+;; support for generics
+(type ['t] MyGenericType (
+  (:name ~ String)
+  (:data ~ 't)
+))
+
+;; custom variant / sum types
 (type ['e 'a] Result (
   (Error ~ 'e)
   (Ok ~ 'a)

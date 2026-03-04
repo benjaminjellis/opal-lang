@@ -69,9 +69,8 @@ pub enum TokenKind {
     And,
     #[token("~>")]
     Arrow,
-    // 1. Ensure FieldAccess is specific
     #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
-    FieldAccess(String),
+    NamedField(String),
 
     #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())] // Matches 3.14, 0.5, etc.
     Float(f64),
@@ -263,7 +262,7 @@ mod tests {
             Ident,
             RCurly,
             LRound,
-            FieldAccess("field_one".to_string()),
+            NamedField("field_one".to_string()),
             Ident,
             RRound,
             RRound,
@@ -281,14 +280,33 @@ mod tests {
     #[test]
     fn product_type() {
         let expected_tokens = vec![
-            LRound, Type, Ident, LRound, LRound, Ident, Tilde, Ident, RRound, LRound, Ident, Tilde,
-            Ident, RRound, LRound, Ident, Tilde, Ident, RRound, RRound, RRound,
+            LRound,
+            Type,
+            Ident,
+            LRound,
+            LRound,
+            NamedField("field_one".to_string()),
+            Tilde,
+            Ident,
+            RRound,
+            LRound,
+            NamedField("field_two".to_string()),
+            Tilde,
+            Ident,
+            RRound,
+            LRound,
+            NamedField("field_three".to_string()),
+            Tilde,
+            Ident,
+            RRound,
+            RRound,
+            RRound,
         ];
         let source = r#"
             (type MyType (
-                (field_one ~ String)
-                (field_two ~ Int)
-                (field_three ~ Bool)
+                (:field_one ~ String)
+                (:field_two ~ Int)
+                (:field_three ~ Bool)
             ))
         "#;
         let lexer = TokenKind::lexer(source);
@@ -341,9 +359,9 @@ mod tests {
 
             ;; custom record type
             (type MyType (
-                (field_one ~ String)
-                (field_two ~ Int)
-                (field_three ~ Bool)
+                (:field_one ~ String)
+                (:field_two ~ Int)
+                (:field_three ~ Bool)
             ))
 
             ;; custom variant types
