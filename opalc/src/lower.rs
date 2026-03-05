@@ -1505,12 +1505,21 @@ impl Lowerer {
                 for chunk in bindings.chunks(2).rev() {
                     let name = match &chunk[0] {
                         SExpr::Atom(t) => self.source_at(file_id, t.span.clone()).to_string(),
-                        _ => {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("expected identifier in let-binding")
-                                    .with_labels(vec![Label::primary(file_id, chunk[0].span())]),
-                            );
+                        other => {
+                            let mut diag = Diagnostic::error()
+                                .with_message("expected identifier in let-binding name position")
+                                .with_labels(vec![Label::primary(file_id, other.span())
+                                    .with_message("this is not a valid binding name")]);
+                            if matches!(other, SExpr::Round(..)) {
+                                diag = diag.with_notes(vec![
+                                    "hint: each binding is `name value` — the value must be a single expression; wrap multiple tokens in parentheses".into(),
+                                ]);
+                            } else {
+                                diag = diag.with_notes(vec![
+                                    "hint: did you forget to wrap a function call in parentheses? e.g. `[x (f a b)]` not `[x f a b]`".into(),
+                                ]);
+                            }
+                            self.error(diag);
                             return None;
                         }
                     };
