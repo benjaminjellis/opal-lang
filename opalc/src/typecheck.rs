@@ -89,7 +89,7 @@ pub enum TypeError {
         /// The file and span of the type definition, if known
         def: Option<(usize, std::ops::Range<usize>)>,
     },
-    UnboundVariable(String),
+    UnboundVariable(String, std::ops::Range<usize>),
 }
 
 impl TypeError {
@@ -215,11 +215,11 @@ impl TypeError {
                 }
                 diags
             }
-            TypeError::UnboundVariable(name) => vec![
+            TypeError::UnboundVariable(name, precise_span) => vec![
                 Diagnostic::error()
                     .with_message(format!("unbound variable `{name}`"))
                     .with_labels(vec![
-                        Label::primary(file_id, span)
+                        Label::primary(file_id, precise_span.clone())
                             .with_message(format!("`{name}` is not defined in this scope")),
                     ]),
             ],
@@ -455,10 +455,10 @@ impl TypeChecker {
                 Ok((HashMap::new(), ty))
             }
 
-            Expr::Variable(name, _) => {
+            Expr::Variable(name, span) => {
                 let scheme = env
                     .get(name)
-                    .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?;
+                    .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
                 Ok((HashMap::new(), self.instantiate(scheme)))
             }
 
@@ -676,7 +676,7 @@ impl TypeChecker {
                 Ok((s, ty))
             }
 
-            Expr::RecordConstruct { fields, .. } => {
+            Expr::RecordConstruct { fields, span, .. } => {
                 // For each :field val pair, look up the field accessor in the env.
                 // Accessor type is `RecordType -> FieldType`.
                 // Unify all accessor record-sides against a single result_ty so the
@@ -686,9 +686,9 @@ impl TypeChecker {
 
                 for (field_name, value_expr) in fields {
                     let accessor_name = format!(":{field_name}");
-                    let scheme = env
-                        .get(&accessor_name)
-                        .ok_or_else(|| TypeError::UnboundVariable(accessor_name.clone()))?;
+                    let scheme = env.get(&accessor_name).ok_or_else(|| {
+                        TypeError::UnboundVariable(accessor_name.clone(), span.clone())
+                    })?;
                     let accessor_ty = self.instantiate(scheme);
 
                     // accessor_ty = RecordType -> FieldType; unify record-side with result_ty
@@ -713,11 +713,16 @@ impl TypeChecker {
             }
 
             // Cross-module call: validate the function exists, return polymorphic type.
-            Expr::QualifiedCall { module, function, .. } => {
+            Expr::QualifiedCall {
+                module,
+                function,
+                span,
+                ..
+            } => {
                 let key = format!("{module}/{function}");
                 match env.get(&key) {
                     Some(_) => Ok((HashMap::new(), self.fresh())),
-                    None => Err(TypeError::UnboundVariable(format!("{module}/{function}"))),
+                    None => Err(TypeError::UnboundVariable(key, span.clone())),
                 }
             }
         }
@@ -752,10 +757,10 @@ impl TypeChecker {
                 };
                 Ok((unify(expected, &ty)?, env.clone()))
             }
-            Pattern::Constructor(name, arg_pats, _) => {
+            Pattern::Constructor(name, arg_pats, span) => {
                 let scheme = env
                     .get(name)
-                    .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?;
+                    .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
                 let mut con_ty = self.instantiate(scheme);
                 let mut subst = HashMap::new();
                 let mut pat_env = env.clone();
@@ -849,7 +854,12 @@ impl TypeChecker {
                         Err(error) => return Err(Box::new((error, expr.clone()))),
                     }
                 }
-                Declaration::ExternLet { name, is_nullary, ty, .. } => {
+                Declaration::ExternLet {
+                    name,
+                    is_nullary,
+                    ty,
+                    ..
+                } => {
                     let resolved = type_sig_to_type(ty);
                     let final_ty = if *is_nullary {
                         // {} means 0-arity Erlang function: wrap as Unit -> ReturnType
@@ -857,7 +867,13 @@ impl TypeChecker {
                     } else {
                         resolved
                     };
-                    env.insert(name.clone(), Scheme { vars: vec![], ty: final_ty });
+                    env.insert(
+                        name.clone(),
+                        Scheme {
+                            vars: vec![],
+                            ty: final_ty,
+                        },
+                    );
                 }
                 Declaration::ExternType { .. } | Declaration::Use { .. } => {
                     // Not yet handled by the typechecker.
@@ -881,7 +897,13 @@ pub fn import_env(names: &[String]) -> TypeEnv {
     for (i, name) in names.iter().enumerate() {
         // Use high IDs that never collide with inference vars (which start at 0)
         let id = u64::MAX - 8192 - i as u64;
-        env.insert(name.clone(), Scheme { vars: vec![id], ty: Rc::new(Type::Var(id)) });
+        env.insert(
+            name.clone(),
+            Scheme {
+                vars: vec![id],
+                ty: Rc::new(Type::Var(id)),
+            },
+        );
     }
     env
 }
@@ -950,22 +972,6 @@ pub fn primitive_env() -> TypeEnv {
             ty: Type::fun(Type::bool(), Type::bool()),
         },
     );
-
-    // String concatenation
-    env.insert(
-        "str".to_string(),
-        fun2(Type::string(), Type::string(), Type::string()),
-    );
-
-    // IO
-    env.insert(
-        "println".to_string(),
-        Scheme {
-            vars: vec![],
-            ty: Type::fun(Type::string(), Type::unit()),
-        },
-    );
-
     env
 }
 
@@ -980,9 +986,7 @@ fn type_sig_to_type(sig: &crate::ast::TypeSig) -> Rc<Type> {
     match sig {
         TypeSig::Named(name) => Type::con(name, vec![]),
         TypeSig::Generic(name) => Type::con(name, vec![]),
-        TypeSig::App(head, args) => {
-            Type::con(head, args.iter().map(type_sig_to_type).collect())
-        }
+        TypeSig::App(head, args) => Type::con(head, args.iter().map(type_sig_to_type).collect()),
         TypeSig::Fun(a, b) => Type::fun(type_sig_to_type(a), type_sig_to_type(b)),
     }
 }
@@ -1215,7 +1219,7 @@ mod tests {
         let env = primitive_env();
         assert!(matches!(
             checker.infer(&env, &expr),
-            Err(TypeError::UnboundVariable(_))
+            Err(TypeError::UnboundVariable(_, _))
         ));
     }
 
@@ -1505,12 +1509,6 @@ mod tests {
     }
 
     #[test]
-    fn infer_string_concat() {
-        let ty = check_expr(r#"(str "hello" " world")"#).unwrap();
-        assert_eq!(ty, Type::string());
-    }
-
-    #[test]
     fn infer_if_non_bool_condition() {
         // Condition must be Bool; Int should fail
         let result = check_expr("(if 1 2 3)");
@@ -1733,7 +1731,7 @@ mod tests {
         "#;
         let result = check(src);
         assert!(
-            matches!(result, Err(TypeError::UnboundVariable(ref s)) if s == "odd"),
+            matches!(result, Err(TypeError::UnboundVariable(ref s, _)) if s == "odd"),
             "expected UnboundVariable(odd), got {:?}",
             result
         );
@@ -1800,15 +1798,6 @@ mod tests {
         assert!(
             result.is_err(),
             "expected type error: Float used with int op"
-        );
-    }
-
-    #[test]
-    fn reject_string_concat_with_int() {
-        let result = check_expr(r#"(str 42 "world")"#);
-        assert!(
-            result.is_err(),
-            "expected type error: str requires String args"
         );
     }
 
@@ -1888,7 +1877,10 @@ mod tests {
     fn reject_or_pattern_type_mismatch() {
         // or-pattern alternatives must agree with the target type; 1 is Int, True is Bool
         let result = check("(let f {x} (match x 1 or True ~> 0 _ ~> 1))\n(let main {} (f 1))");
-        assert!(result.is_err(), "expected type error: Int vs Bool in or-pattern");
+        assert!(
+            result.is_err(),
+            "expected type error: Int vs Bool in or-pattern"
+        );
     }
 
     #[test]
@@ -1920,7 +1912,7 @@ mod tests {
         // The function `f` uses `unknown` which is not in scope
         let result = check("(let f {x} unknown)");
         assert!(
-            matches!(result, Err(TypeError::UnboundVariable(_))),
+            matches!(result, Err(TypeError::UnboundVariable(_, _))),
             "expected UnboundVariable, got {:?}",
             result
         );

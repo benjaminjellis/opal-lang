@@ -1,64 +1,21 @@
-# Opal
-Opal is an experimental lisp-ish language with ml-ish semantics.
+# opal
+opal is an experimental, functional lisp-ish language with ml-ish semantics than runs on [BEAM](https://www.erlang.org/blog/a-brief-beam-primer/)
 
-Below is a sample program
+## Installing
 
+Opal is written in Rust, to install it you'll need a Rust toolchain which you can get from https://rustup.rs/ and to run Opal code you'll need to install erlang.
+
+To install both on arch linux run the following
 ```
-;; custom record / products types
-(type MyType (
-  (:field_one ~ String)
-  (:field_two ~ Int)
-  (:field_three ~ Bool)
-))
-
-;; support for generics
-(type ['t] MyGenericType (
-  (:name ~ String)
-  (:data ~ 't)
-))
-
-;; custom variant / sum types
-(pub type ['e 'a] Result (
-  (Error ~ 'e)
-  (Ok ~ 'a)
-))
-
-(type ['a] Option (
-  None
-  (Some ~ 'a)))
-
-(type MyOtherType (
-  VariantOne
-  (VariantTwo ~ String)))
-
-(let get_field_one {input}
-  (:field_one input))
-
-;; a function
-(let add_three {a b c}
-  ;; this is a comment
-  (let [intermediate (+ a b)
-        final (+ intermediate c)]
-    final))
-
-(let division {a b}
-  (if (= b 0)
-    None
-    (Some (/ a b))))
-
-;; a recursive function
-(let rec fib {n}
-  (if (or (= n 0) (= n 1))
-    n
-    (+ (fib (- n 1)) (fib (- n 2)))))
-
-(let demo {}
-  (let [v #[1 2 3]
-        t VariantOne]
-    (if true
-      (match t
-        VariantOne ~> "ok"
-        (VariantTwo msg) ~> (str "msg=" msg))
-      "missing")))
+sudo pacman -S rustup erlang
 ```
 
+Once you have those installed you can clone this repo and in the route run 
+```
+ cargo install --path loupe
+```
+
+Then you'll be able to use loupe, opal's build tool. 
+
+## Language tour
+TODO

@@ -15,7 +15,7 @@ pub mod typecheck;
 
 /// Compile without any imports (single-file or when imports are already resolved).
 pub fn compile(module_name: &str, source: &str) -> Option<String> {
-    compile_with_imports(module_name, source, HashMap::new(), &HashMap::new())
+    compile_with_imports(module_name, source, HashMap::new(), &HashMap::new(), HashMap::new())
 }
 
 /// Compile with import resolution.
@@ -26,6 +26,7 @@ pub fn compile_with_imports(
     source: &str,
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
+    module_aliases: HashMap<String, String>,
 ) -> Option<String> {
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(source).lex();
@@ -55,19 +56,21 @@ pub fn compile_with_imports(
     // Validate `use` declarations — emit a proper diagnostic for unknown modules
     let mut use_errors = false;
     for decl in &decls {
-        if let ast::Declaration::Use { path: (_, mod_name), span, .. } = decl {
-            if !module_exports.contains_key(mod_name.as_str()) {
-                let diag = codespan_reporting::diagnostic::Diagnostic::error()
-                    .with_message(format!("unknown module `{mod_name}`"))
-                    .with_labels(vec![codespan_reporting::diagnostic::Label::primary(
-                        file_id,
-                        span.clone(),
-                    )
-                    .with_message(format!("`{mod_name}` is not a module in this project"))]);
-                term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, &diag)
-                    .unwrap();
-                use_errors = true;
-            }
+        if let ast::Declaration::Use {
+            path: (_, mod_name),
+            span,
+            ..
+        } = decl
+            && !module_exports.contains_key(mod_name.as_str())
+        {
+            let diag = codespan_reporting::diagnostic::Diagnostic::error()
+                .with_message(format!("unknown module `{mod_name}`"))
+                .with_labels(vec![
+                    codespan_reporting::diagnostic::Label::primary(file_id, span.clone())
+                        .with_message(format!("`{mod_name}` is not a module in this project")),
+                ]);
+            term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, &diag).unwrap();
+            use_errors = true;
         }
     }
     if use_errors {
@@ -97,7 +100,7 @@ pub fn compile_with_imports(
         return None;
     }
 
-    let module = codegen::lower_module(module_name, &decls, imports);
+    let module = codegen::lower_module(module_name, &decls, imports, module_aliases);
     Some(codegen::emit_module(&module))
 }
 
@@ -113,10 +116,12 @@ pub fn exported_names(source: &str) -> Vec<String> {
     let decls = lowerer.lower_file(file_id, &sexprs);
     decls
         .into_iter()
-        .filter_map(|d| {
-            if let ast::Declaration::Expression(ast::Expr::LetFunc { name, is_pub: true, .. }) = d {
+        .filter_map(|d| match d {
+            ast::Declaration::Expression(ast::Expr::LetFunc { name, is_pub: true, .. }) => {
                 Some(name)
-            } else {
+            }
+            ast::Declaration::ExternLet { name, .. } => Some(name),
+            _ => {
                 None
             }
         })
@@ -136,7 +141,12 @@ pub fn pub_reexports(source: &str) -> Vec<String> {
     decls
         .into_iter()
         .filter_map(|d| {
-            if let ast::Declaration::Use { is_pub: true, path: (_, module), .. } = d {
+            if let ast::Declaration::Use {
+                is_pub: true,
+                path: (_, module),
+                ..
+            } = d
+            {
                 Some(module)
             } else {
                 None

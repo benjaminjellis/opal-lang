@@ -12,6 +12,7 @@ pub(crate) const TARGET_DIR: &str = "target";
 pub(crate) const SOURCE_DIR: &str = "src";
 pub(crate) const BIN_ENTRY_POINT: &str = "main.opal";
 pub(crate) const LIB_ROOT: &str = "lib.opal";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // TODO: cargo calls them crates, what are they for opal?
 pub(crate) enum ProjectType {
@@ -21,7 +22,7 @@ pub(crate) enum ProjectType {
 
 #[derive(Parser)]
 #[command(name = "loupe")]
-#[command(version = "0.1")]
+#[command(version = VERSION)]
 #[command(about = "build tool for the opal programming language")]
 struct Cli {
     #[command(subcommand)]

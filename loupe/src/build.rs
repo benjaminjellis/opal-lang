@@ -11,23 +11,27 @@ use eyre::Context;
 use crate::{ProjectType, SOURCE_DIR, TARGET_DIR, manifest};
 
 // opal-std is embedded at compile time — std ships with loupe, no filesystem discovery needed.
-const STD_LIB_SRC: &str = include_str!("../../opal-std/src/lib.opal");
+use include_dir::{Dir, include_dir};
+static STD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../opal-std/src");
 
-/// All submodule sources embedded at compile time.
-/// Add a new entry here whenever a new std module is created.
-static STD_SUBMODULES: &[(&str, &str)] = &[
-    // ("io", include_str!("../../opal-std/src/io.opal")),
-];
+/// Return `(user_name, erlang_name, source)` for each std module:
+///   - user_name:   the name users write in `(use std/io)` → "io"
+///   - erlang_name: the compiled Erlang module name → "opal_io"
+///     Prefixed with "opal_" to avoid shadowing Erlang/OTP built-in modules.
+fn std_modules() -> Vec<(String, String, String)> {
+    let lib_src = STD_DIR
+        .get_file("lib.opal")
+        .and_then(|f| f.contents_utf8())
+        .unwrap_or("");
 
-/// Return (module_name, source) for:
-///   - "std" itself → lib.opal
-///   - each module pub-reexported by lib.opal
-fn std_modules() -> Vec<(String, String)> {
     let mut result = Vec::new();
-    result.push(("std".to_string(), STD_LIB_SRC.to_string()));
-    for mod_name in opalc::pub_reexports(STD_LIB_SRC) {
-        if let Some(src) = STD_SUBMODULES.iter().find(|(n, _)| *n == mod_name.as_str()) {
-            result.push((mod_name, src.1.to_string()));
+    result.push(("std".to_string(), "opal_std".to_string(), lib_src.to_string()));
+
+    for mod_name in opalc::pub_reexports(lib_src) {
+        let file_name = format!("{mod_name}.opal");
+        if let Some(src) = STD_DIR.get_file(&file_name).and_then(|f| f.contents_utf8()) {
+            let erlang_name = format!("opal_{mod_name}");
+            result.push((mod_name, erlang_name, src.to_string()));
         }
     }
     result
@@ -85,10 +89,11 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
 
     // Phase 1b: seed module_exports with embedded std modules so the compiler's
     // `use` validation and import building treats them identically to local modules.
+    // Keyed by user-facing name ("io"), compiled as Erlang name ("opal_io").
     let std_mods = std_modules();
-    for (mod_name, source) in &std_mods {
+    for (user_name, _, source) in &std_mods {
         let exports = opalc::exported_names(source);
-        module_exports.insert(mod_name.clone(), exports);
+        module_exports.insert(user_name.clone(), exports);
     }
 
     // Phase 2: compile each file with its resolved import map
@@ -99,15 +104,27 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         // Build imports: fn_name → module_name for each `use` in this file
         let mut imports: HashMap<String, String> = HashMap::new();
         for (_, mod_name) in opalc::used_modules(source) {
+            // For std modules, route to the prefixed Erlang name to avoid shadowing OTP builtins
+            let erlang_name = std_mods
+                .iter()
+                .find(|(user, _, _)| user == &mod_name)
+                .map(|(_, erl, _)| erl.clone())
+                .unwrap_or_else(|| mod_name.clone());
+
             if let Some(exports) = module_exports.get(&mod_name) {
                 for fn_name in exports {
-                    imports.insert(fn_name.clone(), mod_name.clone());
+                    imports.insert(fn_name.clone(), erlang_name.clone());
                 }
             }
             // Unknown module — the compiler will emit a proper codespan diagnostic
         }
 
-        match opalc::compile_with_imports(module_name, source, imports, &module_exports) {
+        let module_aliases: HashMap<String, String> = std_mods
+            .iter()
+            .map(|(user, erlang, _)| (user.clone(), erlang.clone()))
+            .collect();
+
+        match opalc::compile_with_imports(module_name, source, imports, &module_exports, module_aliases) {
             Some(erl_src) => {
                 let erl_path = build_dir.join(format!("{module_name}.erl"));
                 std::fs::write(&erl_path, erl_src).expect("could not write .erl");
@@ -130,13 +147,13 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         .map(|(_, m)| m)
         .collect();
 
-    for (mod_name, source) in &std_mods {
-        if !used_std_names.contains(mod_name.as_str()) {
+    for (user_name, erlang_name, source) in &std_mods {
+        if !used_std_names.contains(user_name.as_str()) {
             continue;
         }
-        match opalc::compile(mod_name, source) {
+        match opalc::compile(erlang_name, source) {
             Some(erl_src) => {
-                let erl_path = build_dir.join(format!("{mod_name}.erl"));
+                let erl_path = build_dir.join(format!("{erlang_name}.erl"));
                 std::fs::write(&erl_path, erl_src).expect("could not write .erl");
                 erl_paths.push(erl_path);
             }
@@ -163,7 +180,7 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
 
     if run {
         let status = Command::new("erl")
-            .arg("-noshell")
+            .arg("-noinput")
             .arg("-pa")
             .arg(&build_dir)
             .arg("-eval")

@@ -9,13 +9,15 @@ struct Ctx {
     fn_names: HashSet<String>,
     /// Constructor name → arity (0 = nullary atom, 1+ = tuple)
     constructors: HashMap<String, usize>,
-    /// Imported function name → source module (from `use` declarations)
+    /// Imported function name → Erlang module (from `use` declarations)
     imports: HashMap<String, String>,
+    /// User-facing module name → Erlang module name (e.g. "io" → "opal_io")
+    module_aliases: HashMap<String, String>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
-pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<String, String>) -> ir::Module {
+pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<String, String>, module_aliases: HashMap<String, String>) -> ir::Module {
     // Pass 1: collect function names and constructor arities
     let mut fn_names = HashSet::new();
     let mut constructors = HashMap::new();
@@ -44,6 +46,7 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<Str
         fn_names,
         constructors,
         imports,
+        module_aliases,
     };
 
     // Pass 2: lower declarations to IR functions
@@ -201,13 +204,14 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
         }
 
         ast::Expr::QualifiedCall { module, function, args, .. } => {
+            let erl_module = ctx.module_aliases.get(module.as_str()).cloned().unwrap_or_else(|| module.clone());
             if args.is_empty() {
                 // 0-arg: call with unit
-                ir::Expr::RemoteCall(module.clone(), function.clone(), vec![ir::Expr::Atom("unit".into())])
+                ir::Expr::RemoteCall(erl_module, function.clone(), vec![ir::Expr::Atom("unit".into())])
             } else {
                 // First arg goes into the remote call, rest chain as curried calls
                 let first = lower_expr(&args[0], ctx);
-                let mut result = ir::Expr::RemoteCall(module.clone(), function.clone(), vec![first]);
+                let mut result = ir::Expr::RemoteCall(erl_module, function.clone(), vec![first]);
                 for arg in &args[1..] {
                     result = ir::Expr::Call(Box::new(result), Box::new(lower_expr(arg, ctx)));
                 }
