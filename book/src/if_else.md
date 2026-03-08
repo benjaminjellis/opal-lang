@@ -1,5 +1,5 @@
 # If / else
-If else cal be used for control flow as below
+If/else can be used for control flow as below.
 
 ```
 (let abs {x}
@@ -7,4 +7,3 @@ If else cal be used for control flow as below
     (- 0 x)
     x))
 ```
-

@@ -1,17 +1,17 @@
 # Functions
-`Opal` let's users define functions at the top level of a file.
+`Zier` lets users define functions at the top level of a file.
 
-Let's say we have a file called `my_file.opal` with the following contents.
+Let's say we have a file called `my_file.zier` with the following contents:
 ```
 (let square {x}
   (* x x))
 ```
 
-This is a perfectly valid `Opal` file which:
+This is a perfectly valid `Zier` file which:
 - defines a function `square`
 - that takes one arg `x` (arguments to functions live inside the curly brackets `{}`)
-- The body of the function is then defined in the second set of round brackets. This is how you invoke functions in `Opal`, using Polish Notation. The function comes first then the arguments
-- returns `x` squared as `Opal` uses implicit return
+- The body of the function is then defined in the second set of round brackets. This is how you invoke functions in `Zier`, using Polish Notation. The function comes first then the arguments
+- returns `x` squared as `Zier` uses implicit return
 
 So if you wanted to invoke `square` you could define a `main` function like this and call `square` in the body.
 
@@ -20,7 +20,7 @@ So if you wanted to invoke `square` you could define a `main` function like this
   (square 10))
 ```
 
-Opal supports self-recursive functions (with tail call optimisation). So we can write a function to calculate the factorial of a number as below.
+Zier supports self-recursive functions (with tail call optimisation). So we can write a function to calculate the factorial of a number as below.
 
 ```
 (let factorial {n}
@@ -29,7 +29,7 @@ Opal supports self-recursive functions (with tail call optimisation). So we can 
     (* n (factorial (- n 1)))))
 ```
 
-By convention functions names are `snake_case`
+By convention, function names are `snake_case`.
 
 
-`Opal` uses a Hindley-Milner type system, this means that all types are inferred at compile time and no type signatures are required. Because of this `Opal` doesn't actually support type signatures.
+`Zier` uses a Hindley-Milner type system, this means that all types are inferred at compile time and no type signatures are required. Because of this `Zier` doesn't actually support type signatures.

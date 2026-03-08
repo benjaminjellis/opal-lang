@@ -1,0 +1,7 @@
+[package]
+name = "zier-format"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+zierc = { path = "../zierc" }
