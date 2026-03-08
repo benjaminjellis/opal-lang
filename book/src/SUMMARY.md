@@ -1,9 +1,9 @@
 # Summary
 
-[The Opal Programming Language](./the_opal_programming_languge.md)
+[The Zier Programming Language](./the_zier_programming_language.md)
 - [Getting Started](./getting_started.md)
   - [Installation](./installation.md)
-  - [Loupe](./loupe.md)
+  - [The CLI](./cli.md)
 - [Language Tour](./language_tour.md)
   - [Primitive Types](./primitive_types.md)
   - [Functions](./functions.md)

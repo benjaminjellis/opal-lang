@@ -1,5 +1,5 @@
 # Erlang FFI
-Bind an Erlang function to an Opal name with `extern let`, providing a type signature and the `module/function` target:
+Bind an Erlang function to an Zier name with `extern let`, providing a type signature and the `module/function` target:
 
 ```
 (extern let system-time ~ (Unit -> Int) erlang/system_time)

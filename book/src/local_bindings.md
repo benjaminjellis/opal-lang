@@ -16,4 +16,4 @@ As an example below we have a function called `circle_area` which:
 
 Note:
 - like function names local `let` bindings, by convention, use `snake_case` identifiers
-- this function has the type `Float -> Float` which `Opal` infers because of the use of `*.`
+- this function has the type `Float -> Float` which `Zier` infers because of the use of `*.`

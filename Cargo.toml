@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["opalc", "opal-lsp", "loupe", "opal-format"]
+members = ["zierc", "zier-lsp", "zier", "zier-format"]
 
 [workspace.package]
 edition = "2024"

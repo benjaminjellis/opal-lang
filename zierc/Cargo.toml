@@ -1,0 +1,8 @@
+[package]
+name = "zierc"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+codespan-reporting  = { workspace = true }
+logos = { workspace = true }

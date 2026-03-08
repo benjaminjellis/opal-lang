@@ -4,7 +4,7 @@ You can pattern match with the keyword `match`. Use `~>` to separate each patter
 
 Pattern matching works on single variables
 
-```opal
+```zier
 (let describe {n}
   (match n
     0 ~> "zero"
@@ -15,7 +15,7 @@ Pattern matching works on single variables
 
 ... on multiple variables
 
-```opal
+```zier
 (let two_values {x y}
   (match x y
     10 12 ~> (io/println "matched")
@@ -24,7 +24,7 @@ Pattern matching works on single variables
 
 or on lists with the cons operator
 
-```opal
+```zier
 (let iterate {list}
   (match list
     [] ~> (io/println "empty")
@@ -35,7 +35,7 @@ or on lists with the cons operator
 
 For patterns with multiple cases on one branch you can use `or`
 
-```opal
+```zier
 (let is_weekend {day}
   (match day
     "Saturday" or "Sunday" ~> True
@@ -43,10 +43,10 @@ For patterns with multiple cases on one branch you can use `or`
 ```
 
 
-The list example above also introduces the `do` keyword. In some places the compile is expecting only one expression but you might like to do more. This gives us an opportunity to demonstrate something else about `Opal`, the friendlily compiler errors. You may be tempted to not use `do`. You could the write the example above as 
+The list example above also introduces the `do` keyword. In some places, the compiler is expecting only one expression but you might like to do more. This gives us an opportunity to demonstrate something else about `Zier`: the friendly compiler errors. You may be tempted not to use `do`. You could write the example above as:
 
 
-```opal
+```zier
 (let iterate {list} 
   (match list 
     [] ~> (io/println "empty")
@@ -55,11 +55,11 @@ The list example above also introduces the `do` keyword. In some places the comp
                 (iterate t))))
 ```
 
-But if you try and compile this, the compiler would say: 
+But if you try to compile this, the compiler would say:
 
 ```shell
 error: type mismatch: expected `Unit`, found `('a -> 'b)`
-  ┌─ main.opal:6:85
+  ┌─ main.zier:6:85
   │
 6 │ (let iterate {list} (match list [] ~> (io/println "empty") [h | t] ~> ((io/debug h) (iterate t))))
   │                                                                                     ^^^^^^^^^^^ this argument has type `'a`
@@ -67,5 +67,4 @@ error: type mismatch: expected `Unit`, found `('a -> 'b)`
   = expected `Unit`, found `('a -> 'b)`
   = hint: `Unit` is not a function — if you meant to sequence multiple expressions, use `(do expr1 expr2 ...)`
 ```
-
 
