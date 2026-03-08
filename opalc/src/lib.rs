@@ -117,7 +117,7 @@ pub fn compile_with_imports(
         .collect();
     let qualified_names: Vec<String> = module_exports
         .iter()
-        .filter(|(m, _)| !used_modules.contains(m.as_str()))
+        .filter(|(m, _)| used_modules.contains(m.as_str()))
         .flat_map(|(m, fns)| fns.iter().map(move |f| format!("{m}/{f}")))
         .collect();
     let unresolved: Vec<String> = import_names
@@ -314,7 +314,7 @@ pub fn infer_module_exports(
         .collect();
     let qualified_names: Vec<String> = module_exports
         .iter()
-        .filter(|(m, _)| !used_modules.contains(m.as_str()))
+        .filter(|(m, _)| used_modules.contains(m.as_str()))
         .flat_map(|(m, fns)| fns.iter().map(move |f| format!("{m}/{f}")))
         .collect();
     let unresolved: Vec<String> = import_names
@@ -382,4 +382,44 @@ pub fn test_declarations(source: &str) -> Vec<(String, String)> {
 
 pub fn dummy_compile(source: &str) {
     compile("test", source);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_std_call_requires_use() {
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "io".to_string(),
+            vec!["println".to_string(), "debug".to_string()],
+        );
+
+        let without_use = "(let main {} (io/println \"hello\"))";
+        let without_use_result = compile_with_imports(
+            "main",
+            without_use,
+            "main.opal",
+            HashMap::new(),
+            &module_exports,
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(without_use_result.is_none());
+
+        let with_use = "(use std/io)\n(let main {} (io/println \"hello\"))";
+        let with_use_result = compile_with_imports(
+            "main",
+            with_use,
+            "main.opal",
+            HashMap::new(),
+            &module_exports,
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(with_use_result.is_some());
+    }
 }

@@ -198,16 +198,6 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
             }
         }
 
-        // Inject qualified-name schemes for ALL known modules (handles transitive re-exports)
-        for (user_name, schemes) in &all_module_schemes {
-            for (fn_name, scheme) in schemes {
-                let qualified = format!("{user_name}/{fn_name}");
-                imported_schemes
-                    .entry(qualified)
-                    .or_insert_with(|| scheme.clone());
-            }
-        }
-
         let module_aliases: HashMap<String, String> = std_mods
             .iter()
             .map(|(user, erlang, _)| (user.clone(), erlang.clone()))
@@ -269,22 +259,8 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         .map(|(user_name, _, source)| (user_name.clone(), opalc::exported_names(source)))
         .collect();
 
-    // Also compile std sub-modules referenced via qualified idents (e.g. `io/println`)
-    let std_sub_names: std::collections::HashSet<&str> =
-        std_mods.iter().map(|(u, _, _)| u.as_str()).collect();
-    let mut expanded_std_names = used_std_names.clone();
-    for (_, src) in &module_sources {
-        for tok in opalc::lexer::Lexer::new(src).lex() {
-            if let opalc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind
-                && std_sub_names.contains(module.as_str())
-            {
-                expanded_std_names.insert(module);
-            }
-        }
-    }
-
     for (user_name, erlang_name, source) in &std_mods {
-        if !expanded_std_names.contains(user_name.as_str()) {
+        if !used_std_names.contains(user_name.as_str()) {
             continue;
         }
 

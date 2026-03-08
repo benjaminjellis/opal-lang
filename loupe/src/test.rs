@@ -104,16 +104,6 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             }
         }
 
-        // Inject qualified-name schemes for all known modules
-        for (user_name, schemes) in &all_module_schemes {
-            for (fn_name, scheme) in schemes {
-                let qualified = format!("{user_name}/{fn_name}");
-                imported_schemes
-                    .entry(qualified)
-                    .or_insert_with(|| scheme.clone());
-            }
-        }
-
         let module_aliases: HashMap<String, String> = std_mods
             .iter()
             .map(|(user, erlang, _)| (user.clone(), erlang.clone()))
@@ -165,21 +155,12 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         std::process::exit(1);
     }
 
-    // Compile std modules needed by test files (any std module referenced via use or qualified ident)
-    let std_sub_names: std::collections::HashSet<&str> =
-        std_mods.iter().map(|(u, _, _)| u.as_str()).collect();
+    // Compile std modules needed by test files (only those referenced via `use`)
     let mut needed_std: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, source) in &test_module_sources {
         for (_, mod_name, _) in opalc::used_modules(source) {
-            if std_sub_names.contains(mod_name.as_str()) {
+            if std_mods.iter().any(|(u, _, _)| u == &mod_name) {
                 needed_std.insert(mod_name);
-            }
-        }
-        for tok in opalc::lexer::Lexer::new(source).lex() {
-            if let opalc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind
-                && std_sub_names.contains(module.as_str())
-            {
-                needed_std.insert(module);
             }
         }
     }
