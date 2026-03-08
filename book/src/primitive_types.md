@@ -1,5 +1,8 @@
 # Primitive Types
-`Zier` has `Int`, `Float`, `String`, `Bool`, and `Unit` as primitive types. `Int` and `Float` operators are distinct, float operators use a `.` suffix.
+`Zier` has `Int`, `Float`, `String`, `Bool`, and `Unit` as primitive types. 
+
+## Int and Float
+`Int` and `Float` operators are distinct, float operators use a `.` suffix.
 
 We can see this looking at the following two functions (more on those soon).
 
@@ -8,9 +11,9 @@ We can see this looking at the following two functions (more on those soon).
 (let add_floats {a b} (+. a b))  ;; Float -> Float -> Float
 ```
 
-
 `+.` works only for `Float` and `+` works only for `Int`.
 
+## Bool
 `Bool` literals are `True` and `False`.
 
 ```
@@ -18,6 +21,7 @@ We can see this looking at the following two functions (more on those soon).
 (let always_false {} False)
 ```
 
+## String
 `String` literals are enclosed in double quotes.
 
 ```

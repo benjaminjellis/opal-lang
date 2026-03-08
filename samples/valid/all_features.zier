@@ -1,0 +1,71 @@
+;; all_features.zier
+;; A compact showcase of Zier language features.
+
+;; imports (`use`) — qualified, specific unqualified, and wildcard unqualified
+(use std/io)
+(use std/result [Result bind])
+(use std/option [*])
+
+;; extern declarations (`extern let`, nullary extern let, and extern type)
+(pub extern let println ~ (String -> Unit) io/format)
+(extern let system_time {} ~ Int erlang/system_time)
+(pub extern type ['k 'v] Dict maps/map)
+
+;; type declarations: generic variant and generic record
+(pub type ['e 'a] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+
+(pub type ['a] Box ( (:value ~ 'a) (:label ~ String) ))
+
+;; top-level function (`let`) with recursion + `if`
+(let factorial {n} (if (= n 0) 1 (* n (factorial (- n 1)))))
+
+;; needed for `let?`
+(pub let bind {m f} (match m (Ok x) ~> (f x) (Error e) ~> (Error e)))
+
+(let safe_div {a b} (if (= b 0) (Error "division by zero") (Ok (/ a b))))
+
+;; `let?` sugar
+(let chained_div {a b c} (let? [x (safe_div a b) y (safe_div x c)] (Ok y)))
+
+;; list literal + list pattern match ([] and [h | t])
+(let sum_list {xs} (match xs [] ~> 0 [h | t] ~> (+ h (sum_list t))))
+
+;; multi-target + wildcard patterns
+(let pair_tag {x y} (match x y 0 0 ~> "both zero" _ _ ~> "not both zero"))
+
+;; `or` patterns
+(let describe_day {day}
+  (match day
+    "Saturday" or "Sunday" ~> "weekend"
+    _ ~> "weekday"))
+
+;; record construction + field access
+(let make_box {x} (Box :value x :label "payload"))
+
+(let read_value {b} (:value b))
+
+;; anonymous function (`fn`) + higher-order function usage
+(let compose {f g} (fn {x} (f (g x))))
+
+;; bool operators
+(let logic_demo {a b} (and a (or b False)))
+
+;; implicit sequencing in function body + local let bindings + explicit `do`
+(let main {}
+  (io/println "Running all features sample~n")
+  (let [nums        [1 2 3 4]
+        bx          (make_box 42)
+        float_total (+. 3.5 2.25)
+        composed    ((compose (fn {n} (+ n 1)) (fn {n} (* n 2))) 10)
+        now         (system_time)]
+    (do (println (pair_tag 0 0))
+        (println (describe_day "Saturday"))
+        (sum_list nums)
+        (read_value bx)
+        float_total
+        (factorial 5)
+        (logic_demo True False)
+        (chained_div 100 5 4)
+        composed
+        now
+        ())))

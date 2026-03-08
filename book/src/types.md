@@ -1,10 +1,7 @@
 # Types
-If you've ever written Clojure code before, a lot of what we have covered so far will be very familiar, but this section might not be. Unlike Clojure (which heavily inspired `Zier`'s design), `Zier` is statically typed.
-
-There are two forms of types that you can express:
+`Zier` is statically typed. There are two forms of types that you can express:
 
 ## Sum / Variant Types
-
 e.g. `Result` and `Option`
 
 ```
@@ -23,10 +20,9 @@ Sum types have two components:
 1. the name of the type (`Option` in the case above)
 2. the constructors (`None` and `Some`)
 
-The constructors can be nullary (like `None`) or encompass data (like `Some`). The `~` is used to provide a type that `Some` encompasses. This can be a concrete type like `Int` or, as above, it could be a polymorphic type like `'a`.
+The constructors can be nullary (like `None`) or encompass data (like `Some`). The `~` is used to provide a type that `Some` encompasses. This can be a concrete type like `Int` or, as above, it could be a polymorphic type like `'a`. By convention variant / sum type constructors use `PascalCase` identifiers.
 
 ## Product / Record Types
-
 ```
 (type Point
   ((:x ~ Int)
@@ -40,8 +36,8 @@ The constructors can be nullary (like `None`) or encompass data (like `Some`). T
 Record types have fields which, by convention, are `snake_case` identifiers. Each is prefixed with `:`. You can access a field with `(:field record)`. `~` is again used to specify what type each field is. Just like sum/variant types, you can use a polymorphic type like `'a`.
 
 e.g.
-```
-(type ['a] Point 
+```zier
+(type ['a] Point
   ((:x ~ 'a)
    (:y ~ 'a)))
 ```
