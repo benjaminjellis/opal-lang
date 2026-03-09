@@ -1,14 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use crate::{BIN_ENTRY_POINT, LIB_ROOT, TARGET_DIR, gitignore};
-use clap::builder::OsStr;
 use eyre::Context;
 
-use crate::{DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, manifest, utils::find_zier_files};
+use crate::{
+    DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, manifest, resolve::ResolveContext, ui,
+    utils::find_zier_files,
+};
 
 // zier-std is embedded at compile time — std ships with zier,
 use include_dir::{Dir, include_dir};
@@ -59,7 +61,6 @@ pub(crate) struct ErlSources {
 
 /// Compile all Zier source files and write `.erl` output into `erl_dir`.
 /// Returns the generated file paths, the project manifest, and detected project type.
-/// Exits with code 1 on any compilation error.
 pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::Result<ErlSources> {
     let manifest = manifest::read_manifest(project_dir.into())?;
 
@@ -88,10 +89,8 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
             .unwrap_or("unknown")
             .to_string();
 
-        let source = std::fs::read_to_string(zier_path).unwrap_or_else(|e| {
-            eprintln!("error: could not read {}: {e}", zier_path.display());
-            std::process::exit(1);
-        });
+        let source = std::fs::read_to_string(zier_path)
+            .with_context(|| format!("could not read {}", zier_path.display()))?;
 
         let exports = zierc::exported_names(&source);
         let type_decls = zierc::exported_type_decls(&source);
@@ -99,6 +98,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         module_type_decls.insert(module_name.clone(), type_decls);
         module_sources.push((module_name, source));
     }
+    let ordered_module_sources = ordered_user_modules(&module_sources)?;
 
     // Phase 1b: seed module_exports with embedded std modules so the compiler's
     // `use` validation and import building treats them identically to local modules.
@@ -167,87 +167,51 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
     // Phase 2: compile each user file with its resolved import map
     let mut erl_paths: Vec<PathBuf> = Vec::new();
     let mut had_error = false;
+    let resolver = ResolveContext {
+        all_module_schemes: &all_module_schemes,
+        module_type_decls: &module_type_decls,
+        std_aliases: &std_aliases,
+    };
 
-    for (module_name, source) in &module_sources {
-        let mut imports: HashMap<String, String> = HashMap::new();
-        let mut imported_schemes: zierc::typecheck::TypeEnv = HashMap::new();
+    for (module_name, source) in &ordered_module_sources {
+        let resolved = resolver.resolve_for_source(source, &module_exports);
 
-        for (_, mod_name, unqualified) in zierc::used_modules(source) {
-            let erlang_name = std_mods
-                .iter()
-                .find(|(user, _, _)| user == &mod_name)
-                .map(|(_, erl, _)| erl.clone())
-                .unwrap_or_else(|| mod_name.clone());
-
-            if let Some(exports) = module_exports.get(&mod_name) {
-                for fn_name in exports {
-                    if unqualified.includes(fn_name) {
-                        imports.insert(fn_name.clone(), erlang_name.clone());
-                    }
-                }
-            }
-
-            if let Some(mod_schemes) = all_module_schemes.get(&mod_name) {
-                for (fn_name, scheme) in mod_schemes {
-                    if unqualified.includes(fn_name) {
-                        imported_schemes.insert(fn_name.clone(), scheme.clone());
-                    }
-                    imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
-                }
-            }
-        }
-
-        let module_aliases: HashMap<String, String> = std_mods
-            .iter()
-            .map(|(user, erlang, _)| (user.clone(), erlang.clone()))
-            .collect();
-
-        // Type decls (constructors, field accessors) come into scope only for
-        // modules the user explicitly names — either via `(use mod)` or by
-        // writing a qualified call `mod/fn`.  No transitive propagation: if you
-        // want `Some`/`None` you write `(use std/option)`; if you want
-        // `TakeResult` field access you write `(use std/map)` or call `map/take`.
-        let mut referenced_modules: std::collections::HashSet<String> = zierc::used_modules(source)
-            .into_iter()
-            .map(|(_, mod_name, _)| mod_name)
-            .collect();
-        for tok in zierc::lexer::Lexer::new(source).lex() {
-            if let zierc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind {
-                referenced_modules.insert(module);
-            }
-        }
-        let imported_type_decls: Vec<zierc::ast::TypeDecl> = referenced_modules
-            .iter()
-            .flat_map(|mod_name| module_type_decls.get(mod_name).cloned().unwrap_or_default())
-            .collect();
-
-        match zierc::compile_with_imports(
+        let report = zierc::compile_with_imports_report(
             module_name,
             source,
             &format!("{module_name}.zier"),
-            imports,
+            resolved.imports,
             &module_exports,
-            module_aliases,
-            &imported_type_decls,
-            &imported_schemes,
-        ) {
-            Some(erl_src) => {
+            resolved.module_aliases,
+            &resolved.imported_type_decls,
+            &resolved.imported_schemes,
+        );
+        zierc::session::emit_compile_report_with_color(
+            &report,
+            true,
+            ui::diagnostic_color_choice(),
+        );
+        match report.output {
+            Some(erl_src) if !report.has_errors() => {
                 let erl_path = erl_dir.join(format!("{module_name}.erl"));
-                std::fs::write(&erl_path, erl_src).expect("could not write .erl");
+                std::fs::write(&erl_path, erl_src)
+                    .with_context(|| format!("could not write {}", erl_path.display()))?;
                 erl_paths.push(erl_path);
             }
-            None => {
+            _ => {
                 had_error = true;
             }
         }
     }
 
     if had_error {
-        std::process::exit(1);
+        return Err(eyre::eyre!("compilation failed; see diagnostics above"));
     }
 
+    validate_bin_entrypoint(&project_type, &module_sources)?;
+
     // Compile only std modules that are actually used
-    let used_std_names: std::collections::HashSet<String> = module_sources
+    let used_std_names: std::collections::HashSet<String> = ordered_module_sources
         .iter()
         .flat_map(|(_, src)| zierc::used_modules(src))
         .map(|(_, m, _)| m)
@@ -298,7 +262,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
             })
             .collect();
 
-        match zierc::compile_with_imports(
+        let report = zierc::compile_with_imports_report(
             erlang_name,
             source,
             &format!("{erlang_name}.zier"),
@@ -307,14 +271,29 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
             std_aliases.clone(),
             &std_imported_type_decls,
             &std_imported_schemes,
-        ) {
-            Some(erl_src) => {
+        );
+        zierc::session::emit_compile_report_with_color(
+            &report,
+            true,
+            ui::diagnostic_color_choice(),
+        );
+        match report.output {
+            Some(erl_src) if !report.has_errors() => {
                 let erl_path = erl_dir.join(format!("{erlang_name}.erl"));
-                std::fs::write(&erl_path, erl_src).expect("could not write .erl");
+                std::fs::write(&erl_path, erl_src)
+                    .with_context(|| format!("could not write {}", erl_path.display()))?;
                 erl_paths.push(erl_path);
             }
-            None => std::process::exit(1),
+            None => {
+                had_error = true;
+            }
+            Some(_) => {
+                had_error = true;
+            }
         }
+    }
+    if had_error {
+        return Err(eyre::eyre!("compilation failed; see diagnostics above"));
     }
 
     // Copy any hand-written .erl files from zier-std/src/ into the build dir.
@@ -325,7 +304,8 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         if file.path().extension().and_then(|e| e.to_str()) == Some("erl") {
             let file_name = file.path().file_name().unwrap();
             let dest = erl_dir.join(file_name);
-            std::fs::write(&dest, file.contents()).expect("could not write std .erl file");
+            std::fs::write(&dest, file.contents())
+                .with_context(|| format!("could not write {}", dest.display()))?;
             erl_paths.push(dest);
         }
     }
@@ -340,6 +320,107 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         std_mods,
         std_aliases,
     })
+}
+
+fn ordered_user_modules(
+    module_sources: &[(String, String)],
+) -> eyre::Result<Vec<(String, String)>> {
+    let source_by_name: BTreeMap<String, String> = module_sources
+        .iter()
+        .map(|(name, src)| (name.clone(), src.clone()))
+        .collect();
+    if source_by_name.len() != module_sources.len() {
+        return Err(eyre::eyre!(
+            "duplicate module names found in src/: module file stems must be unique"
+        ));
+    }
+
+    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (module_name, source) in &source_by_name {
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        for (namespace, dep, _) in zierc::used_modules(source) {
+            if namespace.is_empty() && source_by_name.contains_key(&dep) {
+                deps.insert(dep);
+            }
+        }
+        graph.insert(module_name.clone(), deps.into_iter().collect());
+    }
+
+    let order = topo_sort_modules(&graph)?;
+    Ok(order
+        .into_iter()
+        .filter_map(|name| source_by_name.get(&name).cloned().map(|src| (name, src)))
+        .collect())
+}
+
+fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> eyre::Result<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        Visiting,
+        Done,
+    }
+
+    fn dfs(
+        node: &str,
+        graph: &BTreeMap<String, Vec<String>>,
+        marks: &mut HashMap<String, Mark>,
+        stack: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) -> eyre::Result<()> {
+        match marks.get(node).copied() {
+            Some(Mark::Done) => return Ok(()),
+            Some(Mark::Visiting) => {
+                let start = stack.iter().position(|n| n == node).unwrap_or(0);
+                let mut cycle: Vec<String> = stack[start..].to_vec();
+                cycle.push(node.to_string());
+                return Err(eyre::eyre!(
+                    "cyclic module dependency detected: {}",
+                    cycle.join(" -> ")
+                ));
+            }
+            None => {}
+        }
+        marks.insert(node.to_string(), Mark::Visiting);
+        stack.push(node.to_string());
+        for dep in graph.get(node).cloned().unwrap_or_default() {
+            dfs(&dep, graph, marks, stack, out)?;
+        }
+        stack.pop();
+        marks.insert(node.to_string(), Mark::Done);
+        out.push(node.to_string());
+        Ok(())
+    }
+
+    let mut marks: HashMap<String, Mark> = HashMap::new();
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    for node in graph.keys() {
+        dfs(node, graph, &mut marks, &mut stack, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn validate_bin_entrypoint(
+    project_type: &ProjectType,
+    module_sources: &[(String, String)],
+) -> eyre::Result<()> {
+    if !matches!(project_type, ProjectType::Bin) {
+        return Ok(());
+    }
+    let Some((_, main_source)) = module_sources
+        .iter()
+        .find(|(module_name, _)| module_name == "main")
+    else {
+        return Err(eyre::eyre!(
+            "binary projects must include src/{BIN_ENTRY_POINT}"
+        ));
+    };
+    if !zierc::has_nullary_main(main_source) {
+        return Err(eyre::eyre!(
+            "src/{BIN_ENTRY_POINT} must define a top-level nullary entrypoint: `(let main {{}} ...)`"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
@@ -365,15 +446,13 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         .arg(&build_dir)
         .args(&erl_paths)
         .output()
-        .unwrap_or_else(|e| {
-            eprintln!("error: could not run erlc: {e}");
-            std::process::exit(1);
-        });
+        .context("could not run erlc")?;
 
     if !erlc.status.success() {
-        eprintln!("erlc failed:");
-        eprintln!("{}", String::from_utf8_lossy(&erlc.stderr));
-        std::process::exit(1);
+        return Err(eyre::eyre!(
+            "erlc failed:\n{}",
+            String::from_utf8_lossy(&erlc.stderr)
+        ));
     }
     if run {
         let status = Command::new("erl")
@@ -383,32 +462,174 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
             .arg("-eval")
             .arg("main:main(unit), init:stop().")
             .status()
-            .unwrap_or_else(|e| {
-                eprintln!("error: could not run erl: {e}");
-                std::process::exit(1);
-            });
+            .context("could not run erl")?;
 
-        std::process::exit(status.code().unwrap_or(1));
+        if !status.success() {
+            return Err(eyre::eyre!(
+                "program exited with status {}",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string())
+            ));
+        }
     } else {
-        println!(
+        ui::success(&format!(
             "built {} ({} module(s))",
             manifest.package.name,
             erl_paths.len()
-        );
+        ));
     }
 
     Ok(())
 }
 
 fn verify_project_type(source_files: &[PathBuf]) -> Option<ProjectType> {
-    let entry_point = OsStr::from(BIN_ENTRY_POINT);
-    let lib_root = OsStr::from(LIB_ROOT);
-    for file in source_files {
-        if file.file_name() == Some(&entry_point) {
-            return Some(ProjectType::Bin);
-        } else if file.file_name() == Some(&lib_root) {
-            return Some(ProjectType::Lib);
-        }
+    let has_root_bin = source_files.iter().any(|file| {
+        file.file_name().and_then(|n| n.to_str()) == Some(BIN_ENTRY_POINT)
+            && file
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n == SOURCE_DIR)
+                .unwrap_or(false)
+    });
+    let has_root_lib = source_files.iter().any(|file| {
+        file.file_name().and_then(|n| n.to_str()) == Some(LIB_ROOT)
+            && file
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n == SOURCE_DIR)
+                .unwrap_or(false)
+    });
+
+    if has_root_bin {
+        Some(ProjectType::Bin)
+    } else if has_root_lib {
+        Some(ProjectType::Lib)
+    } else {
+        None
     }
-    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("zier-build-test-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn validate_bin_entrypoint_accepts_nullary_main() {
+        let modules = vec![("main".to_string(), "(let main {} 0)".to_string())];
+        let result = validate_bin_entrypoint(&ProjectType::Bin, &modules);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_bin_entrypoint_rejects_missing_main_function() {
+        let modules = vec![("main".to_string(), "(let helper {} 0)".to_string())];
+        let result = validate_bin_entrypoint(&ProjectType::Bin, &modules);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_bin_entrypoint_does_not_mask_malformed_main_during_compilation() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let project_dir = root.join("app");
+        std::fs::create_dir_all(project_dir.join("src")).expect("create src dir");
+        let manifest = crate::manifest::create_new_manifest("app".to_string());
+        crate::manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
+            .expect("write manifest");
+        std::fs::write(
+            project_dir.join("src").join(crate::BIN_ENTRY_POINT),
+            r#"(use std/io)
+(use std/list)
+
+(let some_list {} [1 2 3])
+(let main {} (io/debug (list/map fn {x} (+ x 1) (some_list))))
+"#,
+        )
+        .expect("write main");
+
+        let err = match generate_erl_sources(&project_dir, &project_dir.join("target/test-build")) {
+            Ok(_) => panic!("malformed main should fail compilation first"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("compilation failed; see diagnostics above"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("must define a top-level nullary entrypoint"),
+            "entrypoint validation masked compile error: {message}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn validate_bin_entrypoint_ignored_for_lib_projects() {
+        let modules = vec![("main".to_string(), "(let helper {} 0)".to_string())];
+        let result = validate_bin_entrypoint(&ProjectType::Lib, &modules);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_project_type_prefers_root_src_files() {
+        let files = vec![
+            PathBuf::from("/tmp/proj/src/lib.zier"),
+            PathBuf::from("/tmp/proj/src/nested/main.zier"),
+        ];
+        let ty = verify_project_type(&files);
+        assert!(matches!(ty, Some(ProjectType::Lib)));
+    }
+
+    #[test]
+    fn ordered_user_modules_respects_dependencies() {
+        let modules = vec![
+            (
+                "main".to_string(),
+                "(use util)\n(let main {} (util_fn))".to_string(),
+            ),
+            ("util".to_string(), "(let util_fn {} 1)".to_string()),
+            ("other".to_string(), "(let other {} 2)".to_string()),
+        ];
+        let ordered = ordered_user_modules(&modules).expect("topo order");
+        let names: Vec<String> = ordered.into_iter().map(|(n, _)| n).collect();
+        let pos_main = names
+            .iter()
+            .position(|n| n == "main")
+            .expect("main present");
+        let pos_util = names
+            .iter()
+            .position(|n| n == "util")
+            .expect("util present");
+        assert!(pos_util < pos_main, "dependency must come first: {names:?}");
+    }
+
+    #[test]
+    fn ordered_user_modules_rejects_cycles() {
+        let modules = vec![
+            ("a".to_string(), "(use b)\n(let a {} 1)".to_string()),
+            ("b".to_string(), "(use a)\n(let b {} 2)".to_string()),
+        ];
+        let err = ordered_user_modules(&modules).expect_err("expected cycle error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cyclic module dependency detected"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("a -> b -> a") || msg.contains("b -> a -> b"));
+    }
 }

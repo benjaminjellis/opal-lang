@@ -38,12 +38,12 @@ pub enum Declaration {
         erlang_target: (String, String), // (module, function)
         span: Range<usize>,
     },
-    /// For (extern type ['k 'v] Dict erlang/map)
+    /// For (extern type ['k 'v] Dict) or (extern type ['k 'v] Dict erlang/map)
     ExternType {
         is_pub: bool,
         name: String,
         params: Vec<String>,
-        erlang_target: (String, String), // (module, type)
+        erlang_target: Option<(String, String)>, // optional (module, type) metadata
         span: Range<usize>,
     },
     /// For (use std/dict) or (pub use io)
@@ -66,7 +66,7 @@ pub enum Declaration {
 pub enum TypeSig {
     Named(String),                   // Int, String, Bool, Unit, a user type
     Generic(String),                 // 'a, 'b
-    App(String, Vec<TypeSig>),       // Option 'a, Result 'e 'a
+    App(String, Vec<TypeSig>),       // Option 'a, Result 'a 'e
     Fun(Box<TypeSig>, Box<TypeSig>), // A -> B
 }
 
@@ -80,11 +80,11 @@ pub enum TypeDecl {
         fields: Vec<(String, TypeUsage)>, // (field_name, type)
         span: Range<usize>,
     },
-    /// (type ['e 'a] Result ( (Error ~ 'e) (Ok ~ 'a) ))
+    /// (type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
     Variant {
         is_pub: bool,
         name: String,
-        params: Vec<String>,                            // ["'e", "'a"]
+        params: Vec<String>,                            // ["'a", "'e"]
         constructors: Vec<(String, Option<TypeUsage>)>, // (name, payload type)
         span: Range<usize>,
     },
@@ -138,7 +138,7 @@ pub enum Expr {
         fields: Vec<(String, Expr)>,
         span: Range<usize>,
     },
-    /// (fn {x y} body) — anonymous function
+    /// (f {x y} -> body) — anonymous function
     Lambda {
         args: Vec<String>,
         body: Box<Expr>,

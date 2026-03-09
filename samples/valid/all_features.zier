@@ -12,7 +12,7 @@
 (pub extern type ['k 'v] Dict maps/map)
 
 ;; type declarations: generic variant and generic record
-(pub type ['e 'a] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(pub type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
 
 (pub type ['a] Box ( (:value ~ 'a) (:label ~ String) ))
 
@@ -20,7 +20,7 @@
 (let factorial {n} (if (= n 0) 1 (* n (factorial (- n 1)))))
 
 ;; needed for `let?`
-(pub let bind {m f} (match m (Ok x) ~> (f x) (Error e) ~> (Error e)))
+(pub let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
 
 (let safe_div {a b} (if (= b 0) (Error "division by zero") (Ok (/ a b))))
 
@@ -44,8 +44,8 @@
 
 (let read_value {b} (:value b))
 
-;; anonymous function (`fn`) + higher-order function usage
-(let compose {f g} (fn {x} (f (g x))))
+;; anonymous function (`f`) + higher-order function usage
+(let compose {outer inner} (f {x} -> (outer (inner x))))
 
 ;; bool operators
 (let logic_demo {a b} (and a (or b False)))
@@ -56,7 +56,7 @@
   (let [nums        [1 2 3 4]
         bx          (make_box 42)
         float_total (+. 3.5 2.25)
-        composed    ((compose (fn {n} (+ n 1)) (fn {n} (* n 2))) 10)
+        composed    ((compose (f {n} -> (+ n 1)) (f {n} -> (* n 2))) 10)
         now         (system_time)]
     (do (println (pair_tag 0 0))
         (println (describe_day "Saturday"))

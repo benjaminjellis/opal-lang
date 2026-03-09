@@ -299,8 +299,27 @@ fn fmt_let_bindings(bindings: &[SExpr], source: &str) -> Doc {
         pairs.push(fmt(&bindings[i], source));
     }
 
+    // For very long binding vectors, force one pair per line for readability.
+    let approx_flat_len: usize = 2 + bindings
+        .iter()
+        .map(|s| source[s.span()].len() + 1)
+        .sum::<usize>();
+    let force_multiline_pairs = approx_flat_len > 60 && pairs.len() > 1;
+
     // align: when broken, subsequent pairs start at the column right after `[`
-    let inner = join(line(), pairs);
+    let inner = if force_multiline_pairs {
+        let mut docs = Vec::new();
+        let mut iter = pairs.into_iter();
+        if let Some(first) = iter.next() {
+            docs.push(first);
+            for pair in iter {
+                docs.push(concat(hardline(), pair));
+            }
+        }
+        concat_all(docs)
+    } else {
+        join(line(), pairs)
+    };
     group(concat_all([text("["), align(inner), text("]")]))
 }
 
@@ -383,17 +402,22 @@ fn fmt_if(rest: &[SExpr], source: &str) -> Doc {
     }
 }
 
-// ── fn (lambda) ───────────────────────────────────────────────────────────────
+// ── f (lambda) ───────────────────────────────────────────────────────────────
 
 fn fmt_fn(rest: &[SExpr], source: &str) -> Doc {
     match rest {
-        [args @ SExpr::Curly(..), body] => group(concat_all([
-            text("(fn "),
-            fmt(args, source),
-            nest(2, concat(line(), fmt(body, source))),
-            text(")"),
-        ])),
-        _ => fmt_generic_with_head("fn", rest, source),
+        [args @ SExpr::Curly(..), SExpr::Atom(arrow), body]
+            if arrow.kind == TokenKind::ThinArrow =>
+        {
+            group(concat_all([
+                text("(f "),
+                fmt(args, source),
+                text(" ->"),
+                nest(2, concat(line(), fmt(body, source))),
+                text(")"),
+            ]))
+        }
+        _ => fmt_generic_with_head("f", rest, source),
     }
 }
 
@@ -441,7 +465,15 @@ fn fmt_match(rest: &[SExpr], source: &str) -> Doc {
         .into_iter()
         .map(|(pats, body)| {
             let pat_doc = join(text(" "), pats.iter().map(|s| fmt(s, source)).collect());
-            concat_all([pat_doc, text(" ~> "), fmt(body, source)])
+            if arm_body_forces_line_break(body) {
+                concat_all([
+                    pat_doc,
+                    text(" ~>"),
+                    nest(2, concat(line(), fmt(body, source))),
+                ])
+            } else {
+                concat_all([pat_doc, text(" ~> "), fmt(body, source)])
+            }
         })
         .collect();
 
@@ -459,6 +491,16 @@ fn fmt_match(rest: &[SExpr], source: &str) -> Doc {
         ),
         text(")"),
     ])
+}
+
+fn arm_body_forces_line_break(body: &SExpr) -> bool {
+    let SExpr::Round(items, _) = body else {
+        return false;
+    };
+    let Some(SExpr::Atom(head)) = items.first() else {
+        return false;
+    };
+    matches!(head.kind, TokenKind::Match | TokenKind::Do)
 }
 
 /// Split a flat SExpr sequence into match arms: `(patterns, body)`.

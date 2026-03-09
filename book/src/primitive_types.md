@@ -13,6 +13,13 @@ We can see this looking at the following two functions (more on those soon).
 
 `+.` works only for `Float` and `+` works only for `Int`.
 
+Signed numeric literals are also supported:
+
+```
+(let negative_int {} -1)
+(let negative_float {} -1.5)
+```
+
 ## Bool
 `Bool` literals are `True` and `False`.
 

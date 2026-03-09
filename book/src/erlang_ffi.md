@@ -13,8 +13,13 @@ We can do so by binding Erlang functions to `Zier` names with `extern let`. We s
 (pub extern let println ~ (String -> Unit) io/format)
 ```
 
-We can do something very for types e.g. using erlang's dict.
+We can do something similar for opaque foreign-backed types.
 
 ```opal
+(pub extern type Pid)
 (pub extern type ['k 'v] Map maps/map)
 ```
+
+The trailing `module/type` target on `extern type` is optional metadata. Use it
+when it helps document the foreign runtime type, but plain opaque declarations
+such as `(pub extern type Pid)` are also valid.

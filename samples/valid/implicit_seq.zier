@@ -1,6 +1,6 @@
-(type ['e 'a] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
 
-(let bind {m f} (match m (Ok x) ~> (f x) (Error e) ~> (Error e)))
+(let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
 
 (let safe_div {a b} (if (= b 0) (Error "division by zero") (Ok (/ a b))))
 

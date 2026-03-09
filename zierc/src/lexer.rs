@@ -62,7 +62,7 @@ pub enum TokenKind {
     LetBind,
     #[token("let")]
     Let,
-    #[token("fn")]
+    #[token("f", priority = 3)]
     Fn,
     #[token("if")]
     If,
@@ -87,10 +87,11 @@ pub enum TokenKind {
     #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
     NamedField(String),
 
-    #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())] // Matches 3.14, 0.5, etc.
+    #[regex(r"-?[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
+    // Matches 3.14, -0.5, etc.
     Float(f64),
 
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
+    #[regex(r"-?[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Int(i64),
 
     // Generics (e.g., 'a, 'e)
@@ -143,7 +144,7 @@ impl TokenKind {
             TokenKind::Type => "keyword 'type'",
             TokenKind::LetBind => "keyword 'let?'",
             TokenKind::Let => "keyword 'let'",
-            TokenKind::Fn => "keyword 'fn'",
+            TokenKind::Fn => "keyword 'f'",
             TokenKind::If => "keyword 'if'",
             TokenKind::Match => "keyword 'match'",
             TokenKind::Or => "operator 'or'",
@@ -256,6 +257,14 @@ mod tests {
     }
 
     #[test]
+    fn negative_int_literal() {
+        let source = "-42";
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+        assert_eq!(tokens, vec![Int(-42)]);
+    }
+
+    #[test]
     fn float() {
         let expected_tokens = [
             LRound,
@@ -280,6 +289,14 @@ mod tests {
         let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
 
         assert_eq!(tokens, expected_tokens);
+    }
+
+    #[test]
+    fn negative_float_literal() {
+        let source = "-0.5";
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+        assert_eq!(tokens, vec![Float(-0.5)]);
     }
 
     #[test]
@@ -501,6 +518,14 @@ mod tests {
     }
 
     #[test]
+    fn subtraction_still_lexes_as_operator_with_whitespace() {
+        let source = "(- 1 2)";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![LRound, Operator, Int(1), Int(2), RRound]);
+    }
+
+    #[test]
     fn named_field_strips_colon() {
         // :field_name should lex as NamedField("field_name") — colon stripped
         let source = ":foo :bar_baz";
@@ -539,9 +564,9 @@ mod tests {
             ))
 
             ;; custom variant types
-            (type ['e 'a] Result (
-                (Error ~ 'e)
-                (Ok ~ 'a)))
+            (type ['a 'e] Result (
+                (Ok ~ 'a)
+                (Error ~ 'e)))
 
             (type MyOtherType (
                 VariantOne

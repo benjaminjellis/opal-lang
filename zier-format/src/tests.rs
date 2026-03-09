@@ -33,9 +33,10 @@ fn let_func_zero_args() {
 
 #[test]
 fn let_func_breaks_long_body() {
-    // Body is 64 chars; with prefix "(let f {} " (10 chars), total = 74, fits.
+    // Body is 64 chars; with prefix "(let run {} " (12 chars), total still forces a wrap.
     // Make it definitely not fit:
-    let src = "(let f {} (some_really_long_function_name_that_makes_the_line_too_long arg1 arg2))";
+    let src =
+        "(let run {} (some_really_long_function_name_that_makes_the_line_too_long arg1 arg2))";
     let out = fmt(src);
     assert!(out.contains("\n  "), "expected body on new line:\n{out}");
 }
@@ -63,6 +64,24 @@ fn let_local_breaks_long() {
     let src = "(let [very_long_name_one some_value very_long_name_two another_value] body)";
     let out = fmt(src);
     assert!(out.contains('\n'));
+}
+
+#[test]
+fn let_local_long_bindings_break_per_pair() {
+    let src = "(let [me (self) pid (spawn (f {} -> (worker me))) x 10 y 20 z 90 g 500] (send pid \"ping\"))";
+    let out = fmt(src);
+    assert!(
+        out.contains("[me"),
+        "expected bindings vector output:\n{out}"
+    );
+    assert!(
+        out.contains("\n      pid (spawn"),
+        "expected `pid` binding on its own line:\n{out}"
+    );
+    assert!(
+        out.contains("\n      x"),
+        "expected `x` binding on its own line:\n{out}"
+    );
 }
 
 // ── if ────────────────────────────────────────────────────────────────────
@@ -106,6 +125,20 @@ fn match_constructor_arm() {
     assert!(out.contains("(Some v) ~> v"));
 }
 
+#[test]
+fn nested_match_arm_body_breaks_after_arrow() {
+    let src = "(match (self) me ~> (match (spawn (f {} -> (worker me))) pid ~> (do (send pid \"ping\") (match (receive_timeout 1000) (Ok x) ~> (do (io/println \"main got reply~n\") (io/debug x)) (Error _) ~> (io/println \"timed out~n\")))))";
+    let out = fmt(src);
+    assert!(
+        out.contains("me ~>\n"),
+        "expected outer arm body to break onto next line:\n{out}"
+    );
+    assert!(
+        out.contains("pid ~>\n"),
+        "expected inner arm body to break onto next line:\n{out}"
+    );
+}
+
 // ── type ──────────────────────────────────────────────────────────────────
 
 #[test]
@@ -146,9 +179,9 @@ fn consecutive_uses_no_blank_line() {
 
 #[test]
 fn use_then_let_gets_blank_line() {
-    let src = "(use std/io)\n(let f {x} x)";
+    let src = "(use std/io)\n(let ident {x} x)";
     let out = fmt(src);
-    assert_eq!(out, "(use std/io)\n\n(let f {x} x)\n");
+    assert_eq!(out, "(use std/io)\n\n(let ident {x} x)\n");
 }
 
 // ── generic call ──────────────────────────────────────────────────────────
@@ -170,7 +203,7 @@ fn call_breaks_when_long() {
 
 #[test]
 fn multiple_top_level_separated_by_blank_line() {
-    let src = "(let f {x} x)(let g {x} x)";
+    let src = "(let ident {x} x)(let g {x} x)";
     let out = fmt(src);
     assert!(
         out.contains("\n\n"),
@@ -190,7 +223,7 @@ fn idempotent_simple() {
 
 #[test]
 fn idempotent_if() {
-    let src = "(let f {x} (if True x 0))";
+    let src = "(let ident {x} (if True x 0))";
     let once = fmt(src);
     let twice = fmt(once.trim());
     assert_eq!(once, twice);
@@ -198,7 +231,7 @@ fn idempotent_if() {
 
 #[test]
 fn idempotent_match() {
-    let src = "(let f {n} (match n 0 ~> 1 _ ~> (+ n 1)))";
+    let src = "(let ident {n} (match n 0 ~> 1 _ ~> (+ n 1)))";
     let once = fmt(src);
     let twice = fmt(once.trim());
     assert_eq!(
@@ -222,19 +255,22 @@ fn idempotent_type() {
 
 #[test]
 fn leading_comment_before_form() {
-    let src = ";; docs for f\n(let f {x} x)";
-    assert_eq!(fmt(src), ";; docs for f\n(let f {x} x)\n");
+    let src = ";; docs for ident\n(let ident {x} x)";
+    assert_eq!(fmt(src), ";; docs for ident\n(let ident {x} x)\n");
 }
 
 #[test]
 fn comment_block_with_blank_line_preserved() {
-    let src = ";; header\n\n;; docs for f\n(let f {x} x)";
-    assert_eq!(fmt(src), ";; header\n\n;; docs for f\n(let f {x} x)\n");
+    let src = ";; header\n\n;; docs for ident\n(let ident {x} x)";
+    assert_eq!(
+        fmt(src),
+        ";; header\n\n;; docs for ident\n(let ident {x} x)\n"
+    );
 }
 
 #[test]
 fn comment_between_forms() {
-    let src = "(let f {x} x)\n\n;; docs for g\n(let g {x} x)";
+    let src = "(let ident {x} x)\n\n;; docs for g\n(let g {x} x)";
     let out = fmt(src);
     assert!(
         out.contains(";; docs for g\n(let g {x} x)"),
@@ -244,7 +280,7 @@ fn comment_between_forms() {
 
 #[test]
 fn trailing_comment() {
-    let src = "(let f {x} x)\n\n;; end of file";
+    let src = "(let ident {x} x)\n\n;; end of file";
     let out = fmt(src);
     assert!(
         out.contains(";; end of file"),
@@ -254,7 +290,7 @@ fn trailing_comment() {
 
 #[test]
 fn idempotent_with_comments() {
-    let src = ";; header\n\n;; docs\n(let f {x} x)\n\n;; more docs\n(let g {x} x)";
+    let src = ";; header\n\n;; docs\n(let ident {x} x)\n\n;; more docs\n(let g {x} x)";
     let once = fmt(src);
     let twice = fmt(once.trim());
     assert_eq!(
@@ -303,7 +339,7 @@ fn extern_type_sig_flat() {
 
 #[test]
 fn do_single_inline() {
-    assert_eq!(fmt("(do (f x))"), "(do (f x))\n");
+    assert_eq!(fmt("(do (call x))"), "(do (call x))\n");
 }
 
 #[test]
@@ -315,7 +351,7 @@ fn do_multi_breaks() {
 
 #[test]
 fn do_idempotent() {
-    let src = "(let f {x} (do (io/debug x) (io/println \"done\")))";
+    let src = "(let debug_then_print {x} (do (io/debug x) (io/println \"done\")))";
     let out = format(src, 80);
     let out2 = format(&out, 80);
     assert_eq!(out, out2, "formatter is not idempotent on do");

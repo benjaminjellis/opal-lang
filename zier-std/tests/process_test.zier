@@ -1,0 +1,76 @@
+(use std)
+(use std/process)
+(use std/result [Result bind])
+(use std/testing [assert_eq])
+
+(test
+  "process/subject send and receive_timeout"
+  (let [subject (process/new_subject)
+        _ (process/spawn
+            (f {_} ->
+              (do
+                (process/sleep 10)
+                (process/send subject "pong")
+                ())))]
+    (assert_eq (process/receive_timeout subject 1000) (Ok "pong"))))
+
+(test
+  "process/subject timeout filters by tag"
+  (let [wanted (process/new_subject)
+        other (process/new_subject)
+        _ (process/spawn
+            (f {_} ->
+              (do
+                (process/sleep 10)
+                (process/send other "other-message")
+                ())))]
+    (let? [_ (assert_eq (process/receive_timeout wanted 20) (Error ()))]
+      (assert_eq
+        (process/receive_timeout other 1000)
+        (Ok "other-message")))))
+
+(test
+  "process/named_subject send and receive_timeout"
+  (let [name (process/new_name "named-mailbox")
+        subject (process/named_subject name)]
+    (let? [_ (assert_eq (process/register name) (Ok ()))]
+      (let? [_ (assert_eq (process/send subject "named-pong") "named-pong")]
+        (assert_eq (process/receive_timeout subject 1000) (Ok "named-pong"))))))
+
+(test
+  "process/new_name creates distinct registerable names for same prefix"
+  (let [first_name (process/new_name "shared-prefix")
+        second_name (process/new_name "shared-prefix")
+        first_subject (process/named_subject first_name)
+        second_subject (process/named_subject second_name)
+        ready (process/new_subject)
+        first_done (process/new_subject)
+        second_done (process/new_subject)
+        _ (process/spawn
+            (f {_} ->
+              (let [child_subject (process/named_subject first_name)]
+                (do
+                  (process/register first_name)
+                  (process/send ready "ready")
+                  (let [received (process/receive_timeout child_subject 1000)]
+                    (do
+                      (process/send first_done received)
+                      ()))))))
+        _ (process/spawn
+            (f {_} ->
+              (let [child_subject (process/named_subject second_name)]
+                (do
+                  (process/register second_name)
+                  (process/send ready "ready")
+                  (let [received (process/receive_timeout child_subject 1000)]
+                    (do
+                      (process/send second_done received)
+                      ()))))))]
+    (let? [_ (assert_eq (process/receive_timeout ready 1000) (Ok "ready"))]
+      (let? [_ (assert_eq (process/receive_timeout ready 1000) (Ok "ready"))]
+        (let? [_ (assert_eq (process/send first_subject "first") "first")]
+          (let? [_ (assert_eq (process/send second_subject "second") "second")]
+            (let? [_ (assert_eq (process/receive_timeout first_done 1000) (Ok (Ok "first")))]
+              (assert_eq
+                (process/receive_timeout second_done 1000)
+                (Ok (Ok "second"))))))))))

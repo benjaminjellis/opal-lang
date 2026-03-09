@@ -152,12 +152,76 @@ impl SExprParser {
                 return Err(self.mismatch_error(open_span, closer_kind, next));
             }
 
-            children.push(self.parse_one()?);
+            let allow_lambda_shorthand =
+                !matches!(sexpr_type, SExprType::Round) || !children.is_empty();
+            if allow_lambda_shorthand && self.starts_lambda_shorthand() {
+                children.push(self.parse_lambda_shorthand()?);
+            } else {
+                children.push(self.parse_one()?);
+            }
         }
 
         Err(self.error(
             format!("Unclosed delimiter: expected {:?}", closer_kind),
             open_span,
+        ))
+    }
+
+    fn starts_lambda_shorthand(&self) -> bool {
+        if !matches!(
+            self.peek(),
+            Some(Token {
+                kind: TokenKind::Fn,
+                ..
+            })
+        ) {
+            return false;
+        }
+        if !matches!(
+            self.peek_n(1),
+            Some(Token {
+                kind: TokenKind::LCurly,
+                ..
+            })
+        ) {
+            return false;
+        }
+
+        let mut idx = self.pos + 1;
+        let mut depth = 0usize;
+        while let Some(token) = self.tokens.get(idx) {
+            match token.kind {
+                TokenKind::LCurly => depth += 1,
+                TokenKind::RCurly => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(idx + 1),
+                            Some(Token {
+                                kind: TokenKind::ThinArrow,
+                                ..
+                            })
+                        );
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        false
+    }
+
+    fn parse_lambda_shorthand(&mut self) -> Result<SExpr, Diagnostic<usize>> {
+        let fn_token = self.advance();
+        let args = self.parse_sequence(TokenKind::RCurly, SExprType::Curly)?;
+        let arrow = self.advance();
+        debug_assert!(matches!(arrow.kind, TokenKind::ThinArrow));
+        let body = self.parse_one()?;
+        let full_span = fn_token.span.start..body.span().end;
+        Ok(SExpr::Round(
+            vec![SExpr::Atom(fn_token), args, SExpr::Atom(arrow), body],
+            full_span,
         ))
     }
 
@@ -192,6 +256,10 @@ impl SExprParser {
 
     fn peek(&self) -> Option<Token> {
         self.tokens.get(self.pos).cloned()
+    }
+
+    fn peek_n(&self, n: usize) -> Option<Token> {
+        self.tokens.get(self.pos + n).cloned()
     }
 
     fn advance(&mut self) -> Token {
@@ -263,5 +331,23 @@ mod tests {
     #[should_panic(expected = "Unexpected top-level delimiter")]
     fn test_extra_closing() {
         parse_str("(let x 1))");
+    }
+
+    #[test]
+    fn test_lambda_shorthand_is_grouped_as_single_expr() {
+        let exprs = parse_str("(list/map f {x} -> (+ x 1) xs)");
+        let SExpr::Round(items, _) = &exprs[0] else {
+            panic!("expected top-level round expr");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], SExpr::Atom(_)));
+        assert!(matches!(items[1], SExpr::Round(_, _)));
+        let SExpr::Round(lambda_items, _) = &items[1] else {
+            panic!("expected lambda to be grouped as round expr");
+        };
+        assert_eq!(lambda_items.len(), 4);
+        assert!(matches!(lambda_items[0], SExpr::Atom(_)));
+        assert!(matches!(lambda_items[1], SExpr::Curly(_, _)));
+        assert!(matches!(lambda_items[2], SExpr::Atom(_)));
     }
 }

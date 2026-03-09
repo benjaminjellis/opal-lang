@@ -1,6 +1,8 @@
 # The Standard Library
 `Zier`'s standard library is shipped with the CLI and its version is kept in lockstep. One release/version of the CLI will always use the same standard library.
 
+The standard library is intended to provide the well tested building blocks the language and ecosystem needs to grow and succeed.
+
 ## Imports
 To get started with the standard library, we first need to introduce a new concept: imports. `Zier` defines the keyword `use`. Like everything in `Zier`, this lives inside an S-expression.
 
@@ -27,6 +29,9 @@ If you only want to bring in a subset of what's defined in a module and use it i
   (println "hello"))
 ```
 
+
+## Monadic Types
+
 The standard library also provides some useful types like `Option` and `Result`. It is idiomatic to import these in an unqualified manner. This also imports constructors like `None` and `Some`.
 
 ```zier
@@ -51,9 +56,14 @@ The language also provides some syntactic sugar like `let?`. `let?` is a monadic
         (Ok (+ a b)))))
 ```
 
-This desugars to `(bind (might_fail) (fn {a} (bind (also_might_fail a) (fn {b} (Ok (+ a b))))))` and if you run it, you'll see:
+This desugars to `(bind (might_fail) (f {a} -> (bind (also_might_fail a) (f {b} -> (Ok (+ a b))))))` and if you run it, you'll see:
 
 ```shell
 10
 20
 ```
+
+## Processes
+Because `Zier` targets the `BEAM` we can leverage it's model of concurrency. The basic building block of this are `processes`. 
+
+## Unknown

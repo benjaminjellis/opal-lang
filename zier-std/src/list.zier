@@ -1,3 +1,6 @@
+;; list.zier — list helpers backed by Erlang lists
+(use option)
+
 ;; Returns the number of elements in the list.
 (pub extern let length ~ ((List 'a) -> Int) erlang/length)
 
@@ -7,8 +10,8 @@
 ;; Concatenates two lists.
 (pub extern let append ~ ((List 'a) -> (List 'a) -> (List 'a)) lists/append)
 
-;; Returns the Nth element of the list (1-indexed).
-(pub extern let nth ~ (Int -> (List 'a) -> 'a) lists/nth)
+;; Returns the Nth element of the list (0-indexed), or None if out of bounds.
+(pub extern let nth ~ (Int -> (List 'a) -> Option 'a) zier_list_helpers/nth)
 
 ;; Returns true if the element is in the list.
 (pub extern let member ~ ('a -> (List 'a) -> Bool) lists/member)

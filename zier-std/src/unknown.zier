@@ -1,0 +1,26 @@
+(use result)
+
+;; Opaque runtime-backed value from an untyped boundary.
+(pub extern type Unknown)
+
+;; Opaque decoder for turning Unknown values into typed values.
+(pub extern type ['a] Decoder)
+
+;; Minimal structured decode error.
+(pub type DecodeError ( (:expected ~ String) (:found ~ String) ))
+
+;; Lift a typed Zier value into Unknown.
+(pub extern let from ~ ('a -> Unknown) zier_unknown_helpers/from)
+
+;; Run a decoder against an Unknown value.
+(pub extern let run ~ (Unknown -> Decoder 'a -> (Result 'a (List DecodeError))) zier_unknown_helpers/run)
+
+;; Primitive decoders.
+(pub extern let string {} ~ (Decoder String) zier_unknown_helpers/string)
+(pub extern let int {} ~ (Decoder Int) zier_unknown_helpers/int)
+(pub extern let float {} ~ (Decoder Float) zier_unknown_helpers/float)
+(pub extern let bool {} ~ (Decoder Bool) zier_unknown_helpers/bool)
+
+;; Structural decoders.
+(pub extern let list ~ ((Decoder 'a) -> (Decoder (List 'a))) zier_unknown_helpers/list)
+(pub extern let field ~ (String -> (Decoder 'a) -> (Decoder 'a)) zier_unknown_helpers/field)

@@ -13,7 +13,7 @@ use crate::ast::{Expr, Literal, Pattern, TypeDecl, TypeUsage};
 pub enum Type {
     /// Curried function: arg -> ret
     Fun(Rc<Type>, Rc<Type>),
-    /// Named type constructor: Int, Bool, Option<'a>, Result<'e, 'a>
+    /// Named type constructor: Int, Bool, Option<'a>, Result<'a, 'e>
     Con(String, Vec<Rc<Type>>),
     /// Unification variable (T0, T1, ...)
     Var(u64),
@@ -460,6 +460,23 @@ fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
     }
 }
 
+fn is_non_expansive(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Variable(_, _) | Expr::Lambda { .. } => true,
+        Expr::List(items, _) => items.iter().all(is_non_expansive),
+        Expr::RecordConstruct { fields, .. } => {
+            fields.iter().all(|(_, value)| is_non_expansive(value))
+        }
+        Expr::Call { .. }
+        | Expr::QualifiedCall { .. }
+        | Expr::If { .. }
+        | Expr::Match { .. }
+        | Expr::FieldAccess { .. }
+        | Expr::LetFunc { .. }
+        | Expr::LetLocal { .. } => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unification
 // ---------------------------------------------------------------------------
@@ -716,7 +733,12 @@ impl TypeChecker {
                 name, value, body, ..
             } => {
                 let (s1, t_val) = self.infer(env, value)?;
-                let scheme = generalize(&apply_subst_env(&s1, env), &t_val);
+                let ty = apply_subst(&s1, &t_val);
+                let scheme = if is_non_expansive(value) {
+                    generalize(&apply_subst_env(&s1, env), &ty)
+                } else {
+                    Scheme { vars: vec![], ty }
+                };
 
                 let mut body_env = apply_subst_env(&s1, env);
                 body_env.insert(name.clone(), scheme);
@@ -882,6 +904,28 @@ impl TypeChecker {
 
                 let callee_name = format!("{module}/{function}");
                 let mut prev_span: Option<std::ops::Range<usize>> = None;
+                if args.is_empty() {
+                    let ret = self.fresh();
+                    let s_unify = unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(
+                        |e| match e {
+                            TypeError::Mismatch {
+                                expected, found, ..
+                            } => TypeError::Mismatch {
+                                expected,
+                                found,
+                                span: Some(span.clone()),
+                                prior_span: None,
+                                arg_ty: None,
+                                callee_name: Some(callee_name.clone()),
+                                callee_span: Some(fn_span.clone()),
+                            },
+                            other => other,
+                        },
+                    )?;
+                    subst = compose_subst(&s_unify, &subst);
+                    let result_ty = apply_subst(&subst, &ret);
+                    return Ok((subst, result_ty));
+                }
                 for arg in args {
                     let (s_arg, t_arg) = self.infer(&apply_subst_env(&subst, env), arg)?;
                     subst = compose_subst(&s_arg, &subst);
@@ -1081,11 +1125,11 @@ impl TypeChecker {
                     // Not yet handled by the typechecker.
                 }
                 Declaration::Test { name, body, span } => {
-                    // Result is ['e 'a] — error first, ok second
-                    // test bodies must return Result String Unit (Error=String, Ok=Unit)
+                    // Result is ['a 'e] — ok first, error second
+                    // test bodies must return Result Unit String (Ok=Unit, Error=String)
                     let expected = Rc::new(Type::Con(
                         "Result".into(),
-                        vec![Type::string(), Type::unit()],
+                        vec![Type::unit(), Type::string()],
                     ));
                     match self.infer(env, body) {
                         Ok((s, ty)) => {
@@ -1393,6 +1437,26 @@ pub fn constructor_schemes(decl: &TypeDecl) -> TypeEnv {
 mod tests {
     use super::*;
 
+    fn check_with_env(src: &str, extra_env: TypeEnv) -> Result<Rc<Type>, TypeError> {
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let mut lowerer = crate::lower::Lowerer::new();
+
+        let file_id = lowerer.add_file("test.zier".into(), src.into());
+
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse failed");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut checker = TypeChecker::new();
+        let mut env = primitive_env();
+        env.extend(extra_env);
+
+        checker
+            .check_program(&mut env, &decls, file_id)
+            .map_err(|err| err.0)
+    }
+
     fn check(src: &str) -> Result<Rc<Type>, TypeError> {
         let tokens = crate::lexer::Lexer::new(src).lex();
         let mut lowerer = crate::lower::Lowerer::new();
@@ -1460,7 +1524,7 @@ mod tests {
     #[test]
     fn infer_let_binding() {
         // Local bindings live inside function bodies; use a 1-arg wrapper
-        let ty = check("(let f {dummy} (let [x 42] x))\n(let main {} (f 0))").unwrap();
+        let ty = check("(let helper {dummy} (let [x 42] x))\n(let main {} (helper 0))").unwrap();
         assert_eq!(ty, Type::int());
     }
 
@@ -1470,6 +1534,56 @@ mod tests {
         let src = "(let id {x} x)\n(let get_a {dummy} (let [a (id 42) b (id True)] a))\n(let main {} (get_a 0))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_lambda_binding_is_polymorphic_under_value_restriction() {
+        let src = "(let get_id {dummy} (let [id (f {x} -> x) a (id 42) b (id True)] a))\n(let main {} (get_id 0))";
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_constructor_binding_is_polymorphic_under_value_restriction() {
+        let src = "(type ['a] Option (None (Some ~ 'a)))\n(let get_none {dummy} (let [none None a none b none] a))\n(let main {} (get_none 0))";
+        let ty = check(src).unwrap();
+        match ty.as_ref() {
+            Type::Con(name, args) => {
+                assert_eq!(name, "Option");
+                assert_eq!(args.len(), 1);
+            }
+            _ => panic!("expected Con(Option, _), got {:?}", ty),
+        }
+    }
+
+    #[test]
+    fn infer_expansive_process_subject_binding_is_monomorphic() {
+        let mut env = TypeEnv::new();
+        let subject_var = 10_000;
+        env.insert(
+            "process/new_subject".into(),
+            Scheme {
+                vars: vec![subject_var],
+                ty: Type::con("Subject", vec![Rc::new(Type::Var(subject_var))]),
+            },
+        );
+        env.insert(
+            "process/send".into(),
+            Scheme {
+                vars: vec![subject_var],
+                ty: Type::fun(
+                    Type::con("Subject", vec![Rc::new(Type::Var(subject_var))]),
+                    Type::fun(
+                        Rc::new(Type::Var(subject_var)),
+                        Rc::new(Type::Var(subject_var)),
+                    ),
+                ),
+            },
+        );
+
+        let src = "(let main {} (let [subject process/new_subject a (process/send subject \"hello\") b (process/send subject 10)] a))";
+        let err = check_with_env(src, env).expect_err("expected monomorphic subject binding");
+        assert!(matches!(err, TypeError::Mismatch { .. }));
     }
 
     #[test]
@@ -1621,7 +1735,7 @@ mod tests {
 
     #[test]
     fn infer_lambda_identity() {
-        let ty = check_expr("(fn {x} x)").unwrap();
+        let ty = check_expr("(f {x} -> x)").unwrap();
         // Should be 'a -> 'a
         match ty.as_ref() {
             Type::Fun(a, b) => assert_eq!(a, b),
@@ -1632,15 +1746,15 @@ mod tests {
     #[test]
     fn infer_lambda_applied() {
         // Immediately apply a lambda
-        let ty = check_expr("((fn {x} (+ x 1)) 5)").unwrap();
+        let ty = check_expr("((f {x} -> (+ x 1)) 5)").unwrap();
         assert_eq!(ty, Type::int());
     }
 
     #[test]
     fn infer_lambda_as_arg() {
         let src = r#"
-            (let apply {f x} (f x))
-            (let main {} (apply (fn {n} (* n 2)) 3))
+            (let apply {func x} (func x))
+            (let main {} (apply (f {n} -> (* n 2)) 3))
         "#;
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
@@ -1650,12 +1764,12 @@ mod tests {
     fn infer_let_bind() {
         // let? desugars to bind; define a Result bind and use it
         let src = r#"
-            (type ['e 'a] Result (
+            (type ['a 'e] Result (
                 (Ok ~ 'a)
                 (Error ~ 'e)))
-            (let bind {m f}
+            (let bind {m func}
                 (match m
-                    (Ok x) ~> (f x)
+                    (Ok x) ~> (func x)
                     (Error e) ~> (Error e)))
             (let safe_inc {r}
                 (let? [x r]
@@ -1665,7 +1779,7 @@ mod tests {
         let ty = check(src).unwrap();
         // Error type is polymorphic (never constrained); only check the success type
         match ty.as_ref() {
-            Type::Con(name, args) if name == "Result" => assert_eq!(args[1], Type::int()),
+            Type::Con(name, args) if name == "Result" => assert_eq!(args[0], Type::int()),
             _ => panic!("expected Result type, got {ty:?}"),
         }
     }
@@ -1695,17 +1809,17 @@ mod tests {
     #[test]
     fn infer_result_type() {
         let src = r#"
-            (type ['e 'a] Result ((Ok ~ 'a) (Error ~ 'e)))
+            (type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))
             (let identity {r} r)
             (let main {} (identity (Ok 42)))
         "#;
         let ty = check(src).unwrap();
-        // Should be Con("Result", [_, Con("Int", [])])
+        // Should be Con("Result", [Con("Int", []), _])
         match ty.as_ref() {
             Type::Con(name, args) => {
                 assert_eq!(name, "Result");
                 assert_eq!(args.len(), 2);
-                assert_eq!(args[1], Type::int());
+                assert_eq!(args[0], Type::int());
             }
             _ => panic!("expected Con(Result, _), got {:?}", ty),
         }
@@ -1858,8 +1972,8 @@ mod tests {
 
     #[test]
     fn infer_occurs_check() {
-        // (let f {x} (f f)) — calling f with itself causes a -> b = a, infinite type
-        let result = check("(let f {x} (f f))");
+        // (let recur {x} (recur recur)) — calling recur with itself causes a -> b = a, infinite type
+        let result = check("(let recur {x} (recur recur))");
         assert!(
             result.is_err(),
             "expected type error for infinite type, got {:?}",
@@ -1871,7 +1985,7 @@ mod tests {
     fn infer_higher_order_function() {
         // apply : (a -> b) -> a -> b applied to double
         let src = r#"
-            (let apply {f x} (f x))
+            (let apply {func x} (func x))
             (let double {n} (* 2 n))
             (let main {} (apply double 5))
         "#;
@@ -1951,7 +2065,7 @@ mod tests {
     #[test]
     fn infer_nested_sequential_let_with_deps() {
         // y depends on x from the same binding block
-        let src = "(let f {dummy} (let [x 5 y (+ x 3)] y))\n(let main {} (f 0))";
+        let src = "(let helper {dummy} (let [x 5 y (+ x 3)] y))\n(let main {} (helper 0))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
     }
@@ -1960,7 +2074,7 @@ mod tests {
     fn infer_let_binding_shadows_outer() {
         // Inner x shadows the outer x — wrapped in a function since local bindings
         // are not valid at the top level
-        let src = "(let f {dummy} (let [x 1] (let [x True] x)))\n(let main {} (f 0))";
+        let src = "(let helper {dummy} (let [x 1] (let [x True] x)))\n(let main {} (helper 0))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::bool());
     }
@@ -1992,7 +2106,7 @@ mod tests {
     #[test]
     fn infer_function_as_argument() {
         // Pass `not` as a higher-order argument
-        let src = "(let apply {f x} (f x))\n(let main {} (apply not True))";
+        let src = "(let apply {func x} (func x))\n(let main {} (apply not True))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::bool());
     }
@@ -2170,7 +2284,7 @@ mod tests {
     #[test]
     fn infer_or_pattern_match() {
         // All alternatives are Int literals; result is Bool
-        let src = "(let f {x} (match x 1 or 2 or 3 ~> True _ ~> False))\n(let main {} (f 1))";
+        let src = "(let pred {x} (match x 1 or 2 or 3 ~> True _ ~> False))\n(let main {} (pred 1))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::bool());
     }
@@ -2178,7 +2292,8 @@ mod tests {
     #[test]
     fn reject_or_pattern_type_mismatch() {
         // or-pattern alternatives must agree with the target type; 1 is Int, True is Bool
-        let result = check("(let f {x} (match x 1 or True ~> 0 _ ~> 1))\n(let main {} (f 1))");
+        let result =
+            check("(let pred {x} (match x 1 or True ~> 0 _ ~> 1))\n(let main {} (pred 1))");
         assert!(
             result.is_err(),
             "expected type error: Int vs Bool in or-pattern"
@@ -2188,14 +2303,15 @@ mod tests {
     #[test]
     fn infer_multi_target_match() {
         // Two targets, two patterns per arm; both arms return Bool
-        let src = "(let f {x y} (match x y 1 1 ~> True _ _ ~> False))\n(let main {} (f 1 1))";
+        let src = "(let both {x y} (match x y 1 1 ~> True _ _ ~> False))\n(let main {} (both 1 1))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::bool());
     }
 
     #[test]
     fn infer_empty_list_pattern() {
-        let src = "(let f {lst} (match lst [] ~> 0 [h | _] ~> 1))\n(let main {} (f []))";
+        let src =
+            "(let classify {lst} (match lst [] ~> 0 [h | _] ~> 1))\n(let main {} (classify []))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
     }
@@ -2203,7 +2319,7 @@ mod tests {
     #[test]
     fn infer_cons_pattern_binds_head() {
         // h is bound to the head element — must be Int since the list is Int list
-        let src = "(let f {lst} (match lst [] ~> 0 [h | _] ~> h))\n(let main {} (f [1 2 3]))";
+        let src = "(let head_or_zero {lst} (match lst [] ~> 0 [h | _] ~> h))\n(let main {} (head_or_zero [1 2 3]))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
     }
@@ -2211,7 +2327,7 @@ mod tests {
     #[test]
     fn infer_cons_pattern_binds_tail() {
         // t is bound to the tail — must be List Int
-        let src = "(let f {lst} (match lst [] ~> lst [_ | t] ~> t))\n(let main {} (f [1 2]))";
+        let src = "(let tail_or_self {lst} (match lst [] ~> lst [_ | t] ~> t))\n(let main {} (tail_or_self [1 2]))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::array(Type::int()));
     }
@@ -2242,11 +2358,11 @@ mod tests {
     fn reject_cons_pattern_wrong_element_type() {
         // list is List Int but arm body uses h as Bool — should fail
         let src = r#"
-            (let f {lst}
+            (let only_bool_list {lst}
               (match lst
                 [] ~> False
                 [h | _] ~> (= h True)))
-            (let main {} (f [1 2]))
+            (let main {} (only_bool_list [1 2]))
         "#;
         assert!(
             check(src).is_err(),
@@ -2257,7 +2373,7 @@ mod tests {
     #[test]
     fn reject_let_binding_type_error_in_sequence() {
         // x is Bool, but (+ x 1) requires Int
-        let result = check("(let f {dummy} (let [x True y (+ x 1)] y))");
+        let result = check("(let helper {dummy} (let [x True y (+ x 1)] y))");
         assert!(
             result.is_err(),
             "expected type error: Bool used in int addition"
@@ -2272,8 +2388,8 @@ mod tests {
 
     #[test]
     fn reject_unbound_in_let_body() {
-        // The function `f` uses `unknown` which is not in scope
-        let result = check("(let f {x} unknown)");
+        // The function `helper` uses `unknown` which is not in scope
+        let result = check("(let helper {x} unknown)");
         assert!(
             matches!(result, Err(TypeError::UnboundVariable(_, _))),
             "expected UnboundVariable, got {:?}",

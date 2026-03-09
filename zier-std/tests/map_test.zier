@@ -1,0 +1,42 @@
+(use std)
+(use std/map)
+(use std/option [Option])
+(use std/testing [assert_eq assert])
+(use std/result [bind])
+
+(let sample_map {}
+  (map/put "language" "zier" (map/put "year" "2026" (map/new))))
+
+(test
+  "map/new starts empty"
+  (let [m (map/new)]
+    (let? [_ (assert_eq (map/size m) 0)]
+      (assert_eq (map/get "missing" m) None))))
+
+(test
+  "map/put and map/get round trip"
+  (assert_eq (map/get "language" (sample_map)) (Some "zier")))
+
+(test
+  "map/has detects present and absent keys"
+  (let [m (sample_map)]
+    (let? [_ (assert (map/has "year" m))]
+      (assert_eq (map/has "missing" m) False))))
+
+(test
+  "map/remove deletes a key"
+  (let [m (map/remove "language" (sample_map))]
+    (let? [_ (assert_eq (map/has "language" m) False)]
+      (assert_eq (map/size m) 1))))
+
+(test
+  "map/take returns value and updated map for present key"
+  (let [taken (map/take "language" (sample_map))]
+    (let? [_ (assert_eq (:value taken) (Some "zier"))]
+      (assert_eq (map/has "language" (:map taken)) False))))
+
+(test
+  "map/take returns none and original map for missing key"
+  (let [m (sample_map) taken (map/take "missing" m)]
+    (let? [_ (assert_eq (:value taken) None)]
+      (assert_eq (:map taken) m))))

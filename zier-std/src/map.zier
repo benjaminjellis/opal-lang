@@ -3,7 +3,7 @@
 (pub extern type ['k 'v] Map maps/map)
 
 ;; Create an empty map.
-(pub extern let new ~ (Map 'k 'v) maps/new)
+(pub extern let new {} ~ (Map 'k 'v) maps/new)
 
 ;; Insert or update a key.
 (pub extern let put ~ ('k -> 'v -> Map 'k 'v -> Map 'k 'v) maps/put)

@@ -13,3 +13,4 @@ toml = { workspace = true }
 serde = { workspace = true }
 semver = { workspace = true, features = [ "serde" ] }
 walkdir = { workspace = true }
+codespan-reporting = { workspace = true }

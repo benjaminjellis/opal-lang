@@ -4,11 +4,15 @@
 assert_eq(A, A) ->
     {ok, unit};
 assert_eq(Expected, Got) ->
-    Msg = lists:flatten(io_lib:format("expected ~p~n         got      ~p", [Expected, Got])),
+    Msg = iolist_to_binary(
+        io_lib:format("expected ~p~n         got      ~p", [Expected, Got])
+    ),
     {error, Msg}.
 
 assert_ne(A, B) when A =/= B ->
     {ok, unit};
 assert_ne(A, _B) ->
-    Msg = lists:flatten(io_lib:format("expected values to differ, but both were ~p", [A])),
+    Msg = iolist_to_binary(
+        io_lib:format("expected values to differ, but both were ~p", [A])
+    ),
     {error, Msg}.

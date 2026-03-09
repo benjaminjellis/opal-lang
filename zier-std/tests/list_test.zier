@@ -1,0 +1,42 @@
+(use std)
+(use std/list)
+(use std/option [Option])
+(use std/result [bind])
+(use std/testing [assert_eq])
+
+(let test_list {} [1 2 3 4 5 6 7 8 9])
+
+(test
+  "list/nth with negative accessor"
+  (let [list  (test_list) value (list/nth -1 list)] (assert_eq value None)))
+
+(test
+  "list/nth with out of bounds accessor"
+  (let [list  (test_list) value (list/nth 100 list)] (assert_eq value None)))
+
+(test
+  "list/nth is 0-indexed"
+  (let [list  (test_list) value (list/nth 0 list)] (assert_eq value (Some 1))))
+
+(test
+  "list/length reverse and append"
+  (let [list (test_list)]
+    (let? [_ (assert_eq (list/length list) 9)]
+      (let? [_ (assert_eq (list/reverse [1 2 3]) [3 2 1])]
+        (assert_eq (list/append [1 2] [3 4]) [1 2 3 4])))))
+
+(test
+  "list/member map and filter"
+  (let? [_ (assert_eq (list/member 4 (test_list)) True)]
+    (let? [_ (assert_eq (list/map (f {x} -> (+ x 1)) [1 2 3]) [2 3 4])]
+      (assert_eq (list/filter (f {x} -> (> x 2)) [1 2 3 4]) [3 4]))))
+
+(test
+  "list/foldl and foldr"
+  (let? [_ (assert_eq (list/foldl (f {x acc} -> (+ acc x)) 0 [1 2 3 4]) 10)]
+    (assert_eq (list/foldr (f {x acc} -> (- x acc)) 0 [1 2 3]) 2)))
+
+(test
+  "list/sort and flatten"
+  (let? [_ (assert_eq (list/sort [3 1 2]) [1 2 3])]
+    (assert_eq (list/flatten [[1 2] [3] [4 5]]) [1 2 3 4 5])))

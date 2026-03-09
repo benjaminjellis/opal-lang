@@ -5,6 +5,7 @@ use eyre::Context;
 use crate::{
     ProjectType, TARGET_DIR,
     build::{ErlSources, generate_erl_sources},
+    ui,
 };
 
 pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
@@ -77,7 +78,7 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
         .context("could not run rebar3 — is it installed?")?;
 
     if !rebar3.status.success() {
-        eprintln!("rebar3 failed:");
+        ui::error("rebar3 failed:");
         eprintln!("{}", String::from_utf8_lossy(&rebar3.stderr));
         std::process::exit(1);
     }
@@ -88,7 +89,11 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
         .join("bin")
         .join(&app_name);
 
-    println!("released {} to {}", manifest.package.name, bin.display());
+    ui::success(&format!(
+        "released {} to {}",
+        manifest.package.name,
+        bin.display()
+    ));
 
     Ok(())
 }

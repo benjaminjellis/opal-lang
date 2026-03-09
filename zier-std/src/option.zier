@@ -1,1 +1,19 @@
+(use result [Result])
+
 (pub type ['a] Option ( None (Some ~ 'a) ))
+
+(pub let is_some {option} (match option (Some _) ~> True None ~> False))
+
+(pub let is_none {option} (match option (Some _) ~> False None ~> True))
+
+(pub let from_result {result}
+  (match result
+    (Ok x) ~> (Some x)
+    (Error _) ~> None))
+
+(pub let unwrap_or {option or} (match option (Some x) ~> x None ~> or))
+
+(pub let map {option function}
+  (match option
+    (Some x) ~> (function x)
+    None ~> None))

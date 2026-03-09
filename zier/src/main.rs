@@ -5,7 +5,9 @@ mod gitignore;
 mod manifest;
 mod new;
 mod release;
+mod resolve;
 mod test;
+mod ui;
 mod utils;
 
 use std::path::{Path, PathBuf};
@@ -75,7 +77,10 @@ fn main() -> eyre::Result<()> {
             }
         }
         Commands::New { name, lib } => {
+            let project_name = name.clone();
             new::create_new_project(name, root, lib)?;
+            let kind = if lib { "library" } else { "binary" };
+            ui::success(&format!("created {kind} project `{project_name}`"));
         }
         Commands::Run => {
             build::build(root, true)?;

@@ -1,0 +1,65 @@
+(use std)
+(use std/map)
+(use std/result [Result])
+(use std/unknown [DecodeError])
+(use std/testing [assert_eq])
+
+(let player_data {} (map/put "name" "Lucy" (map/new)))
+
+(test
+  "unknown/int success"
+  (assert_eq (unknown/run (unknown/from 42) (unknown/int)) (Ok 42)))
+
+(test
+  "unknown/int failure"
+  (assert_eq
+    (unknown/run (unknown/from "nope") (unknown/int))
+    (Error [(DecodeError :expected "Int" :found "String")])))
+
+(test
+  "unknown/float success"
+  (assert_eq
+    (unknown/run (unknown/from 1.5) (unknown/float))
+    (Ok 1.5)))
+
+(test
+  "unknown/bool success"
+  (assert_eq
+    (unknown/run (unknown/from True) (unknown/bool))
+    (Ok True)))
+
+(test
+  "unknown/list of int success"
+  (assert_eq
+    (unknown/run (unknown/from [1 2 3]) (unknown/list (unknown/int)))
+    (Ok [1 2 3])))
+
+(test
+  "unknown/list of int failure"
+  (assert_eq
+    (unknown/run (unknown/from ["one" "two"]) (unknown/list (unknown/int)))
+    (Error [(DecodeError :expected "Int" :found "String")])))
+
+(test
+  "unknown/field success"
+  (assert_eq
+    (unknown/run
+      (unknown/from (player_data))
+      (unknown/field "name" (unknown/string)))
+    (Ok "Lucy")))
+
+(test
+  "unknown/field missing"
+  (assert_eq
+    (unknown/run
+      (unknown/from (player_data))
+      (unknown/field "email" (unknown/string)))
+    (Error [(DecodeError :expected "Field" :found "Nothing")])))
+
+(test
+  "unknown/field requires map input"
+  (assert_eq
+    (unknown/run
+      (unknown/from "not-a-map")
+      (unknown/field "name" (unknown/string)))
+    (Error [(DecodeError :expected "Map" :found "String")])))

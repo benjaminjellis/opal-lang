@@ -1,0 +1,37 @@
+(use result)
+(use unknown [Unknown])
+
+;; A process identifier.
+(pub extern type Pid)
+(pub extern type ['m] Name)
+
+(pub type SubjectPayload ( (:owner ~ Pid) (:tag ~ Unknown) ))
+
+(pub type ['m] Subject ( (Subject ~ SubjectPayload) (NamedSubject ~ Name 'm) ))
+
+;; Return the current process identifier.
+(pub extern let self {} ~ Pid erlang/self)
+
+;; Spawn a new process that runs the given nullary function.
+(pub extern let spawn ~ ((Unit -> Unit) -> Pid) zier_process_helpers/spawn)
+
+;; Sleep for N milliseconds.
+(pub extern let sleep ~ (Int -> Unit) timer/sleep)
+
+;; Construct a globally named subject.
+(pub extern let new_name ~ (String -> Name 'm) zier_process_helpers/new_name)
+
+;; Register the current process under a name.
+(pub extern let register ~ (Name 'm -> (Result Unit String)) zier_process_helpers/register)
+
+;; Create a fresh typed subject owned by the current process.
+(pub extern let new_subject {} ~ (Subject 'm) zier_process_helpers/new_subject)
+
+;; Wrap a registered name as a typed subject.
+(pub extern let named_subject ~ (Name 'm -> Subject 'm) zier_process_helpers/named_subject)
+
+;; Send a typed message to a subject.
+(pub extern let send ~ (Subject 'm -> 'm -> 'm) zier_process_helpers/send)
+
+;; Receive the next message for this subject, timing out after N milliseconds.
+(pub extern let receive_timeout ~ (Subject 'm -> Int -> (Result 'm Unit)) zier_process_helpers/receive_timeout)

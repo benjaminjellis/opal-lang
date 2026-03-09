@@ -684,14 +684,12 @@ impl Lowerer {
         items: &[SExpr],
         span: Range<usize>,
     ) -> Option<Expr> {
-        // (fn {x y} body)
-        // items[0] = fn, items[1] = {args}, items[2] = body
-        if items.len() != 3 {
+        if items.len() != 4 {
             self.error(
                 Diagnostic::error()
                     .with_message("invalid anonymous function syntax")
                     .with_labels(vec![Label::primary(file_id, span.clone())])
-                    .with_notes(vec!["syntax: (fn {arg1 arg2} body)".into()]),
+                    .with_notes(vec!["syntax: (f {arg1 arg2} -> body)".into()]),
             );
             return None;
         }
@@ -715,13 +713,29 @@ impl Lowerer {
                             Label::primary(file_id, items[1].span())
                                 .with_message("expected curly braces here"),
                         ])
-                        .with_notes(vec!["syntax: (fn {arg1 arg2} body)".into()]),
+                        .with_notes(vec!["syntax: (f {arg1 arg2} -> body)".into()]),
                 );
                 return None;
             }
         };
 
-        let body = self.lower_expr(file_id, &items[2])?;
+        if !matches!(
+            items.get(2),
+            Some(SExpr::Atom(Token {
+                kind: TokenKind::ThinArrow,
+                ..
+            }))
+        ) {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid anonymous function syntax")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec!["syntax: (f {arg1 arg2} -> body)".into()]),
+            );
+            return None;
+        }
+
+        let body = self.lower_expr(file_id, &items[3])?;
         Some(Expr::Lambda {
             args,
             body: Box::new(body),
@@ -775,7 +789,7 @@ impl Lowerer {
 
         let body = self.lower_expr(file_id, &items[2])?;
 
-        // Desugar right-to-left into nested (bind expr (fn {name} ...))
+        // Desugar right-to-left into nested (bind expr (f {name} -> ...))
         let mut pairs: Vec<(String, Expr)> = Vec::new();
         for chunk in bindings.chunks(2) {
             let name = match &chunk[0] {
@@ -1087,7 +1101,7 @@ impl Lowerer {
                         )])
                         .with_notes(vec![
                             "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
-                            "syntax: (extern type ['k 'v] Name module/type)".into(),
+                            "syntax: (extern type ['k 'v] Name [module/type])".into(),
                         ]),
                 );
                 None
@@ -1200,7 +1214,7 @@ impl Lowerer {
     }
 
     /// Lower an `extern type` declaration.
-    /// Syntax: (extern type ['k 'v] Name module/type)
+    /// Syntax: (extern type ['k 'v] Name [module/type])
     fn lower_extern_type(
         &mut self,
         file_id: usize,
@@ -1208,7 +1222,7 @@ impl Lowerer {
         span: Range<usize>,
         is_pub: bool,
     ) -> Option<Declaration> {
-        // items[0]=extern, items[1]=type, then optional ['k 'v], then Name, then module/type
+        // items[0]=extern, items[1]=type, then optional ['k 'v], then Name, then optional module/type
         let mut cursor = 2;
 
         let mut params = Vec::new();
@@ -1238,35 +1252,51 @@ impl Lowerer {
         cursor += 1;
 
         let erlang_target = match items.get(cursor) {
+            None => None,
             Some(SExpr::Atom(t)) => match &t.kind {
-                TokenKind::QualifiedIdent((module, ty)) => (module.clone(), ty.clone()),
+                TokenKind::QualifiedIdent((module, ty)) => Some((module.clone(), ty.clone())),
                 _ => {
                     self.error(
                         Diagnostic::error()
-                            .with_message("expected an Erlang target as module/type")
+                            .with_message("expected an optional extern type target as module/type")
                             .with_labels(vec![
                                 Label::primary(file_id, t.span.clone())
                                     .with_message("expected e.g. erlang/map"),
                             ])
                             .with_notes(vec![
+                                "syntax: (extern type ['k 'v] Name)".into(),
                                 "syntax: (extern type ['k 'v] Name module/type)".into(),
                             ]),
                     );
                     return None;
                 }
             },
-            other => {
+            Some(other) => {
                 self.error(
                     Diagnostic::error()
-                        .with_message("expected an Erlang target as module/type")
-                        .with_labels(vec![Label::primary(
-                            file_id,
-                            other.map(|s| s.span()).unwrap_or(span.clone()),
-                        )]),
+                        .with_message("expected an optional extern type target as module/type")
+                        .with_labels(vec![Label::primary(file_id, other.span())])
+                        .with_notes(vec![
+                            "syntax: (extern type ['k 'v] Name)".into(),
+                            "syntax: (extern type ['k 'v] Name module/type)".into(),
+                        ]),
                 );
                 return None;
             }
         };
+
+        if items.len() > cursor + 1 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid extern type declaration")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec![
+                        "syntax: (extern type ['k 'v] Name)".into(),
+                        "syntax: (extern type ['k 'v] Name module/type)".into(),
+                    ]),
+            );
+            return None;
+        }
 
         Some(Declaration::ExternType {
             is_pub,
@@ -1389,10 +1419,25 @@ impl Lowerer {
                         }
                     } else {
                         let mut names = Vec::with_capacity(contents.len());
+                        let mut seen = std::collections::HashSet::with_capacity(contents.len());
                         for item in contents {
                             match item {
                                 SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
-                                    names.push(self.source_at(file_id, t.span.clone()).to_string());
+                                    let name = self.source_at(file_id, t.span.clone()).to_string();
+                                    if !seen.insert(name.clone()) {
+                                        self.error(
+                                            Diagnostic::error()
+                                                .with_message("duplicate import in list")
+                                                .with_labels(vec![
+                                                    Label::primary(file_id, t.span.clone())
+                                                        .with_message(format!(
+                                                            "`{name}` appears more than once"
+                                                        )),
+                                                ]),
+                                        );
+                                        return None;
+                                    }
+                                    names.push(name);
                                 }
                                 other => {
                                     self.error(
@@ -2416,7 +2461,7 @@ mod tests {
     #[test]
     fn test_variant_type_multiple_constructors() {
         let (mut lowerer, file_id, sexprs) =
-            setup("(type ['e 'a] Result ((Ok ~ 'a) (Error ~ 'e)))");
+            setup("(type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))");
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert_eq!(exprs.len(), 1);
         if let Declaration::Type(TypeDecl::Variant {
@@ -2427,7 +2472,7 @@ mod tests {
         }) = &exprs[0]
         {
             assert_eq!(name, "Result");
-            assert_eq!(params, &vec!["'e".to_string(), "'a".to_string()]);
+            assert_eq!(params, &vec!["'a".to_string(), "'e".to_string()]);
             assert_eq!(constructors.len(), 2);
             let (ok_name, ok_payload) = &constructors[0];
             assert_eq!(ok_name, "Ok");
@@ -2803,6 +2848,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_extern_type_without_target_is_valid() {
+        let (mut lowerer, file_id, sexprs) = setup("(pub extern type Pid)");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        match &decls[0] {
+            Declaration::ExternType {
+                is_pub,
+                name,
+                params,
+                erlang_target,
+                ..
+            } => {
+                assert!(*is_pub);
+                assert_eq!(name, "Pid");
+                assert!(params.is_empty());
+                assert!(erlang_target.is_none());
+            }
+            _ => panic!("expected ExternType"),
+        }
+    }
+
+    #[test]
+    fn test_extern_type_with_target_is_still_valid() {
+        let (mut lowerer, file_id, sexprs) = setup("(pub extern type ['k 'v] Map maps/map)");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        match &decls[0] {
+            Declaration::ExternType {
+                name,
+                params,
+                erlang_target,
+                ..
+            } => {
+                assert_eq!(name, "Map");
+                assert_eq!(params, &vec!["'k".to_string(), "'v".to_string()]);
+                assert_eq!(
+                    erlang_target.as_ref(),
+                    Some(&("maps".to_string(), "map".to_string()))
+                );
+            }
+            _ => panic!("expected ExternType"),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Lowerer rejection tests — invalid syntax that must produce diagnostics
     // -------------------------------------------------------------------------
@@ -2994,5 +3084,15 @@ mod tests {
             lowerer.diagnostics[0].message,
             "only function and type declarations are valid at the top level"
         );
+    }
+
+    #[test]
+    fn test_use_duplicate_import_name_rejected() {
+        let src = "(use std/io [println println])";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(lowerer.diagnostics[0].message, "duplicate import in list");
     }
 }

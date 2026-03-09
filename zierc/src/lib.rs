@@ -1,17 +1,694 @@
-use std::collections::HashMap;
-
-use codespan_reporting::term::{
-    self,
-    termcolor::{ColorChoice, StandardStream},
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub mod ast;
 pub mod codegen;
 pub mod ir;
 pub mod lexer;
 pub mod lower;
+pub mod resolve;
+pub mod session;
 pub mod sexpr;
 pub mod typecheck;
+
+fn imported_names_for_use_decl(
+    mod_name: &str,
+    unqualified: &ast::UnqualifiedImports,
+    module_exports: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    match unqualified {
+        ast::UnqualifiedImports::None => vec![],
+        ast::UnqualifiedImports::Specific(names) => names.clone(),
+        ast::UnqualifiedImports::Wildcard => {
+            module_exports.get(mod_name).cloned().unwrap_or_default()
+        }
+    }
+}
+
+fn duplicate_import_diagnostics(
+    decls: &[ast::Declaration],
+    file_id: usize,
+    module_exports: &HashMap<String, Vec<String>>,
+) -> Vec<codespan_reporting::diagnostic::Diagnostic<usize>> {
+    use codespan_reporting::diagnostic::{Diagnostic, Label};
+
+    let mut imported: HashMap<String, (String, std::ops::Range<usize>)> = HashMap::new();
+    let mut diags = Vec::new();
+
+    for decl in decls {
+        let ast::Declaration::Use {
+            path: (_, mod_name),
+            unqualified,
+            span,
+            ..
+        } = decl
+        else {
+            continue;
+        };
+
+        for name in imported_names_for_use_decl(mod_name, unqualified, module_exports) {
+            if let Some((first_module, first_span)) = imported.get(&name) {
+                diags.push(
+                    Diagnostic::error()
+                        .with_message(format!("duplicate import `{name}`"))
+                        .with_labels(vec![
+                            Label::primary(file_id, span.clone())
+                                .with_message(format!("`{name}` also imported here")),
+                            Label::secondary(file_id, first_span.clone())
+                                .with_message(format!("first imported from `{first_module}`")),
+                        ]),
+                );
+            } else {
+                imported.insert(name, (mod_name.clone(), span.clone()));
+            }
+        }
+    }
+
+    diags
+}
+
+fn bind_pattern_names(pat: &ast::Pattern, out: &mut HashSet<String>) {
+    match pat {
+        ast::Pattern::Variable(name, _) => {
+            out.insert(name.clone());
+        }
+        ast::Pattern::Constructor(_, args, _) => {
+            for arg in args {
+                bind_pattern_names(arg, out);
+            }
+        }
+        ast::Pattern::Or(pats, _) => {
+            for p in pats {
+                bind_pattern_names(p, out);
+            }
+        }
+        ast::Pattern::Cons(head, tail, _) => {
+            bind_pattern_names(head, out);
+            bind_pattern_names(tail, out);
+        }
+        ast::Pattern::Any(_) | ast::Pattern::Literal(_, _) | ast::Pattern::EmptyList(_) => {}
+    }
+}
+
+fn collect_top_level_refs(
+    expr: &ast::Expr,
+    top_level: &HashSet<String>,
+    locals: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    use ast::Expr;
+    match expr {
+        Expr::Literal(_, _) => {}
+        Expr::Variable(name, _) => {
+            if top_level.contains(name.as_str()) && !locals.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        Expr::List(items, _) => {
+            for item in items {
+                collect_top_level_refs(item, top_level, locals, out);
+            }
+        }
+        Expr::LetFunc {
+            name, args, value, ..
+        } => {
+            let mut inner = locals.clone();
+            inner.insert(name.clone());
+            inner.extend(args.iter().cloned());
+            collect_top_level_refs(value, top_level, &inner, out);
+        }
+        Expr::LetLocal {
+            name, value, body, ..
+        } => {
+            collect_top_level_refs(value, top_level, locals, out);
+            let mut body_locals = locals.clone();
+            body_locals.insert(name.clone());
+            collect_top_level_refs(body, top_level, &body_locals, out);
+        }
+        Expr::If {
+            cond, then, els, ..
+        } => {
+            collect_top_level_refs(cond, top_level, locals, out);
+            collect_top_level_refs(then, top_level, locals, out);
+            collect_top_level_refs(els, top_level, locals, out);
+        }
+        Expr::Call { func, args, .. } => {
+            collect_top_level_refs(func, top_level, locals, out);
+            for arg in args {
+                collect_top_level_refs(arg, top_level, locals, out);
+            }
+        }
+        Expr::Match { targets, arms, .. } => {
+            for target in targets {
+                collect_top_level_refs(target, top_level, locals, out);
+            }
+            for (patterns, body) in arms {
+                let mut arm_locals = locals.clone();
+                for pat in patterns {
+                    bind_pattern_names(pat, &mut arm_locals);
+                }
+                collect_top_level_refs(body, top_level, &arm_locals, out);
+            }
+        }
+        Expr::FieldAccess { record, .. } => {
+            collect_top_level_refs(record, top_level, locals, out);
+        }
+        Expr::RecordConstruct { fields, .. } => {
+            for (_, value) in fields {
+                collect_top_level_refs(value, top_level, locals, out);
+            }
+        }
+        Expr::Lambda { args, body, .. } => {
+            let mut inner = locals.clone();
+            inner.extend(args.iter().cloned());
+            collect_top_level_refs(body, top_level, &inner, out);
+        }
+        Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_top_level_refs(arg, top_level, locals, out);
+            }
+        }
+    }
+}
+
+fn unused_function_spans(decls: &[ast::Declaration]) -> Vec<(String, std::ops::Range<usize>)> {
+    let mut top_level: HashMap<String, (bool, Vec<String>, ast::Expr, std::ops::Range<usize>)> =
+        HashMap::new();
+    let mut test_roots: Vec<ast::Expr> = Vec::new();
+
+    for decl in decls {
+        match decl {
+            ast::Declaration::Expression(ast::Expr::LetFunc {
+                name,
+                is_pub,
+                args,
+                value,
+                span,
+            }) => {
+                top_level.insert(
+                    name.clone(),
+                    (*is_pub, args.clone(), value.as_ref().clone(), span.clone()),
+                );
+            }
+            ast::Declaration::Test { body, .. } => {
+                test_roots.push(body.as_ref().clone());
+            }
+            _ => {}
+        }
+    }
+
+    let top_names: HashSet<String> = top_level.keys().cloned().collect();
+    let mut refs: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, (_, args, body, _)) in &top_level {
+        let mut local_scope: HashSet<String> = args.iter().cloned().collect();
+        local_scope.insert(name.clone());
+        let mut used = HashSet::new();
+        collect_top_level_refs(body, &top_names, &local_scope, &mut used);
+        refs.insert(name.clone(), used);
+    }
+
+    let mut roots: Vec<String> = top_level
+        .iter()
+        .filter_map(|(name, (is_pub, _, _, _))| {
+            if *is_pub || name == "main" {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !test_roots.is_empty() {
+        let empty_scope = HashSet::new();
+        let mut test_used = HashSet::new();
+        for body in &test_roots {
+            collect_top_level_refs(body, &top_names, &empty_scope, &mut test_used);
+        }
+        roots.extend(test_used);
+    }
+
+    let mut reachable = HashSet::new();
+    let mut queue: VecDeque<String> = roots.into_iter().collect();
+    while let Some(name) = queue.pop_front() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        if let Some(neighbors) = refs.get(&name) {
+            for n in neighbors {
+                queue.push_back(n.clone());
+            }
+        }
+    }
+
+    top_level
+        .into_iter()
+        .filter_map(|(name, (is_pub, _, _, span))| {
+            if !is_pub && !reachable.contains(&name) {
+                Some((name, span))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn collect_unqualified_free_vars(
+    expr: &ast::Expr,
+    locals: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    use ast::Expr;
+    match expr {
+        Expr::Literal(_, _) => {}
+        Expr::Variable(name, _) => {
+            if !locals.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        Expr::List(items, _) => {
+            for item in items {
+                collect_unqualified_free_vars(item, locals, out);
+            }
+        }
+        Expr::LetFunc {
+            name, args, value, ..
+        } => {
+            let mut inner = locals.clone();
+            inner.insert(name.clone());
+            inner.extend(args.iter().cloned());
+            collect_unqualified_free_vars(value, &inner, out);
+        }
+        Expr::LetLocal {
+            name, value, body, ..
+        } => {
+            collect_unqualified_free_vars(value, locals, out);
+            let mut inner = locals.clone();
+            inner.insert(name.clone());
+            collect_unqualified_free_vars(body, &inner, out);
+        }
+        Expr::If {
+            cond, then, els, ..
+        } => {
+            collect_unqualified_free_vars(cond, locals, out);
+            collect_unqualified_free_vars(then, locals, out);
+            collect_unqualified_free_vars(els, locals, out);
+        }
+        Expr::Call { func, args, .. } => {
+            collect_unqualified_free_vars(func, locals, out);
+            for arg in args {
+                collect_unqualified_free_vars(arg, locals, out);
+            }
+        }
+        Expr::Match { targets, arms, .. } => {
+            for target in targets {
+                collect_unqualified_free_vars(target, locals, out);
+            }
+            for (patterns, body) in arms {
+                for pat in patterns {
+                    collect_pattern_constructor_names(pat, out);
+                }
+                let mut arm_locals = locals.clone();
+                for pat in patterns {
+                    bind_pattern_names(pat, &mut arm_locals);
+                }
+                collect_unqualified_free_vars(body, &arm_locals, out);
+            }
+        }
+        Expr::FieldAccess { record, .. } => {
+            collect_unqualified_free_vars(record, locals, out);
+        }
+        Expr::RecordConstruct { name, fields, .. } => {
+            if !locals.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+            for (_, value) in fields {
+                collect_unqualified_free_vars(value, locals, out);
+            }
+        }
+        Expr::Lambda { args, body, .. } => {
+            let mut inner = locals.clone();
+            inner.extend(args.iter().cloned());
+            collect_unqualified_free_vars(body, &inner, out);
+        }
+        Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_unqualified_free_vars(arg, locals, out);
+            }
+        }
+    }
+}
+
+fn collect_type_usage_names(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
+    match ty {
+        ast::TypeUsage::Named(name) => {
+            out.insert(name.clone());
+        }
+        ast::TypeUsage::Generic(_) => {}
+        ast::TypeUsage::App(head, args) => {
+            out.insert(head.clone());
+            for arg in args {
+                collect_type_usage_names(arg, out);
+            }
+        }
+    }
+}
+
+fn collect_decl_type_usage_names(decl: &ast::TypeDecl, out: &mut HashSet<String>) {
+    match decl {
+        ast::TypeDecl::Record { fields, .. } => {
+            for (_, ty) in fields {
+                collect_type_usage_names(ty, out);
+            }
+        }
+        ast::TypeDecl::Variant { constructors, .. } => {
+            for (_, payload) in constructors {
+                if let Some(ty) = payload {
+                    collect_type_usage_names(ty, out);
+                }
+            }
+        }
+    }
+}
+
+fn used_unqualified_names(decls: &[ast::Declaration]) -> HashSet<String> {
+    let mut used = HashSet::new();
+    let empty_locals = HashSet::new();
+    for decl in decls {
+        match decl {
+            ast::Declaration::Expression(ast::Expr::LetFunc {
+                name, args, value, ..
+            }) => {
+                let mut locals: HashSet<String> = args.iter().cloned().collect();
+                locals.insert(name.clone());
+                collect_unqualified_free_vars(value, &locals, &mut used);
+            }
+            ast::Declaration::Test { body, .. } => {
+                collect_unqualified_free_vars(body, &empty_locals, &mut used);
+            }
+            ast::Declaration::Type(type_decl) => {
+                collect_decl_type_usage_names(type_decl, &mut used);
+            }
+            _ => {}
+        }
+    }
+    used
+}
+
+fn collect_pattern_constructor_names(pat: &ast::Pattern, out: &mut HashSet<String>) {
+    match pat {
+        ast::Pattern::Constructor(name, args, _) => {
+            out.insert(name.clone());
+            for arg in args {
+                collect_pattern_constructor_names(arg, out);
+            }
+        }
+        ast::Pattern::Or(pats, _) => {
+            for p in pats {
+                collect_pattern_constructor_names(p, out);
+            }
+        }
+        ast::Pattern::Cons(head, tail, _) => {
+            collect_pattern_constructor_names(head, out);
+            collect_pattern_constructor_names(tail, out);
+        }
+        ast::Pattern::Any(_)
+        | ast::Pattern::Variable(_, _)
+        | ast::Pattern::Literal(_, _)
+        | ast::Pattern::EmptyList(_) => {}
+    }
+}
+
+fn collect_expr_type_decl_refs(
+    expr: &ast::Expr,
+    locals: &HashSet<String>,
+    used_value_names: &mut HashSet<String>,
+    used_record_type_names: &mut HashSet<String>,
+) {
+    use ast::Expr;
+    match expr {
+        Expr::Literal(_, _) => {}
+        Expr::Variable(name, _) => {
+            if !locals.contains(name.as_str()) {
+                used_value_names.insert(name.clone());
+            }
+        }
+        Expr::List(items, _) => {
+            for item in items {
+                collect_expr_type_decl_refs(item, locals, used_value_names, used_record_type_names);
+            }
+        }
+        Expr::LetFunc {
+            name, args, value, ..
+        } => {
+            let mut inner = locals.clone();
+            inner.insert(name.clone());
+            inner.extend(args.iter().cloned());
+            collect_expr_type_decl_refs(value, &inner, used_value_names, used_record_type_names);
+        }
+        Expr::LetLocal {
+            name, value, body, ..
+        } => {
+            collect_expr_type_decl_refs(value, locals, used_value_names, used_record_type_names);
+            let mut inner = locals.clone();
+            inner.insert(name.clone());
+            collect_expr_type_decl_refs(body, &inner, used_value_names, used_record_type_names);
+        }
+        Expr::If {
+            cond, then, els, ..
+        } => {
+            collect_expr_type_decl_refs(cond, locals, used_value_names, used_record_type_names);
+            collect_expr_type_decl_refs(then, locals, used_value_names, used_record_type_names);
+            collect_expr_type_decl_refs(els, locals, used_value_names, used_record_type_names);
+        }
+        Expr::Call { func, args, .. } => {
+            collect_expr_type_decl_refs(func, locals, used_value_names, used_record_type_names);
+            for arg in args {
+                collect_expr_type_decl_refs(arg, locals, used_value_names, used_record_type_names);
+            }
+        }
+        Expr::Match { targets, arms, .. } => {
+            for target in targets {
+                collect_expr_type_decl_refs(
+                    target,
+                    locals,
+                    used_value_names,
+                    used_record_type_names,
+                );
+            }
+            for (patterns, body) in arms {
+                for pat in patterns {
+                    collect_pattern_constructor_names(pat, used_value_names);
+                }
+                let mut arm_locals = locals.clone();
+                for pat in patterns {
+                    bind_pattern_names(pat, &mut arm_locals);
+                }
+                collect_expr_type_decl_refs(
+                    body,
+                    &arm_locals,
+                    used_value_names,
+                    used_record_type_names,
+                );
+            }
+        }
+        Expr::FieldAccess { record, .. } => {
+            collect_expr_type_decl_refs(record, locals, used_value_names, used_record_type_names);
+        }
+        Expr::RecordConstruct { name, fields, .. } => {
+            used_record_type_names.insert(name.clone());
+            for (_, value) in fields {
+                collect_expr_type_decl_refs(
+                    value,
+                    locals,
+                    used_value_names,
+                    used_record_type_names,
+                );
+            }
+        }
+        Expr::Lambda { args, body, .. } => {
+            let mut inner = locals.clone();
+            inner.extend(args.iter().cloned());
+            collect_expr_type_decl_refs(body, &inner, used_value_names, used_record_type_names);
+        }
+        Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_expr_type_decl_refs(arg, locals, used_value_names, used_record_type_names);
+            }
+        }
+    }
+}
+
+fn unused_type_spans(decls: &[ast::Declaration]) -> Vec<(String, std::ops::Range<usize>)> {
+    let mut private_record_types: HashMap<String, std::ops::Range<usize>> = HashMap::new();
+    let mut private_variant_types: HashMap<String, (Vec<String>, std::ops::Range<usize>)> =
+        HashMap::new();
+    for decl in decls {
+        if let ast::Declaration::Type(type_decl) = decl {
+            match type_decl {
+                ast::TypeDecl::Record {
+                    is_pub, name, span, ..
+                } => {
+                    if !is_pub {
+                        private_record_types.insert(name.clone(), span.clone());
+                    }
+                }
+                ast::TypeDecl::Variant {
+                    is_pub,
+                    name,
+                    constructors,
+                    span,
+                    ..
+                } => {
+                    if !is_pub {
+                        let constructor_names = constructors
+                            .iter()
+                            .map(|(constructor_name, _)| constructor_name.clone())
+                            .collect();
+                        private_variant_types
+                            .insert(name.clone(), (constructor_names, span.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut used_type_names = HashSet::new();
+    let mut used_value_names = HashSet::new();
+    let mut used_record_type_names = HashSet::new();
+    let empty_locals = HashSet::new();
+    for decl in decls {
+        match decl {
+            ast::Declaration::Type(type_decl) => {
+                collect_decl_type_usage_names(type_decl, &mut used_type_names);
+            }
+            ast::Declaration::Expression(ast::Expr::LetFunc {
+                name, args, value, ..
+            }) => {
+                let mut locals: HashSet<String> = args.iter().cloned().collect();
+                locals.insert(name.clone());
+                collect_expr_type_decl_refs(
+                    value,
+                    &locals,
+                    &mut used_value_names,
+                    &mut used_record_type_names,
+                );
+            }
+            ast::Declaration::Test { body, .. } => {
+                collect_expr_type_decl_refs(
+                    body,
+                    &empty_locals,
+                    &mut used_value_names,
+                    &mut used_record_type_names,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut unused = Vec::new();
+    for (name, span) in private_record_types {
+        if !used_type_names.contains(name.as_str())
+            && !used_record_type_names.contains(name.as_str())
+        {
+            unused.push((name, span));
+        }
+    }
+    for (name, (constructor_names, span)) in private_variant_types {
+        let constructor_used = constructor_names
+            .iter()
+            .any(|constructor_name| used_value_names.contains(constructor_name.as_str()));
+        if !used_type_names.contains(name.as_str()) && !constructor_used {
+            unused.push((name, span));
+        }
+    }
+    unused
+}
+
+fn unused_unqualified_import_diagnostics(
+    decls: &[ast::Declaration],
+    file_id: usize,
+    module_exports: &HashMap<String, Vec<String>>,
+    imported_type_decls: &[ast::TypeDecl],
+) -> Vec<codespan_reporting::diagnostic::Diagnostic<usize>> {
+    use codespan_reporting::diagnostic::{Diagnostic, Label};
+
+    let used = used_unqualified_names(decls);
+    let mut diags = Vec::new();
+
+    for decl in decls {
+        let ast::Declaration::Use {
+            path: (_, mod_name),
+            unqualified,
+            span,
+            ..
+        } = decl
+        else {
+            continue;
+        };
+
+        match unqualified {
+            ast::UnqualifiedImports::None => {}
+            ast::UnqualifiedImports::Specific(names) => {
+                let unused: Vec<String> = names
+                    .iter()
+                    .filter(|name| {
+                        if used.contains(name.as_str()) {
+                            return false;
+                        }
+                        // Importing a variant type also imports its constructors.
+                        // Count constructor usage (e.g. Ok/Error) as usage of the type import.
+                        let ctor_used = imported_type_decls.iter().any(|type_decl| {
+                            let ast::TypeDecl::Variant {
+                                name: type_name,
+                                constructors,
+                                ..
+                            } = type_decl
+                            else {
+                                return false;
+                            };
+                            if type_name != *name {
+                                return false;
+                            }
+                            constructors
+                                .iter()
+                                .any(|(ctor_name, _)| used.contains(ctor_name))
+                        });
+                        !ctor_used
+                    })
+                    .cloned()
+                    .collect();
+                if !unused.is_empty() {
+                    diags.push(
+                        Diagnostic::warning()
+                            .with_message(format!(
+                                "unused unqualified imports from `{mod_name}`: {}",
+                                unused.join(", ")
+                            ))
+                            .with_labels(vec![
+                                Label::primary(file_id, span.clone())
+                                    .with_message("these imports are never used unqualified"),
+                            ]),
+                    );
+                }
+            }
+            ast::UnqualifiedImports::Wildcard => {
+                let exports = module_exports
+                    .get(mod_name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                if !exports.is_empty() && !exports.iter().any(|name| used.contains(name.as_str())) {
+                    diags.push(
+                        Diagnostic::warning()
+                            .with_message(format!("unused wildcard import from `{mod_name}`"))
+                            .with_labels(vec![Label::primary(file_id, span.clone()).with_message(
+                                "no unqualified names from this wildcard import are used",
+                            )]),
+                    );
+                }
+            }
+        }
+    }
+
+    diags
+}
 
 /// Compile without any imports (single-file or when imports are already resolved).
 pub fn compile(module_name: &str, source: &str) -> Option<String> {
@@ -27,13 +704,9 @@ pub fn compile(module_name: &str, source: &str) -> Option<String> {
     )
 }
 
-/// Compile with import resolution.
-/// - `imports`: unqualified name → module (from `use` declarations)
-/// - `module_exports`: module name → exported function names (for validating qualified calls)
-/// - `imported_type_decls`: pub type declarations from imported modules (brings constructors into scope)
-/// - `imported_schemes`: real type schemes from imported modules (keyed by "fn" or "module/fn")
 #[allow(clippy::too_many_arguments)]
-pub fn compile_with_imports(
+pub fn compile_with_imports_in_session(
+    sess: &mut session::CompilerSession,
     module_name: &str,
     source: &str,
     source_path: &str,
@@ -42,29 +715,38 @@ pub fn compile_with_imports(
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
     imported_schemes: &typecheck::TypeEnv,
-) -> Option<String> {
+) -> session::CompileReport {
+    let mut diagnostics = Vec::new();
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(source).lex();
-    let writer = StandardStream::stderr(ColorChoice::Always);
-    let config = codespan_reporting::term::Config::default();
 
     let file_id = lowerer.add_file(source_path.to_string(), source.to_string());
 
     let sexprs = match crate::sexpr::SExprParser::new(tokens, file_id).parse() {
         Ok(res) => res,
         Err(diag) => {
-            term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, &diag).unwrap();
-            return None;
+            diagnostics.push(diag.clone());
+            sess.emit(&lowerer.files, &diag);
+            return session::CompileReport {
+                output: None,
+                files: lowerer.files,
+                diagnostics,
+            };
         }
     };
 
     let decls = lowerer.lower_file(file_id, &sexprs);
 
     for diag in &lowerer.diagnostics {
-        term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, diag).unwrap();
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, diag);
     }
     if !lowerer.diagnostics.is_empty() {
-        return None;
+        return session::CompileReport {
+            output: None,
+            files: lowerer.files,
+            diagnostics,
+        };
     }
 
     // Validate `use` declarations — emit a proper diagnostic for unknown modules
@@ -83,12 +765,29 @@ pub fn compile_with_imports(
                     codespan_reporting::diagnostic::Label::primary(file_id, span.clone())
                         .with_message(format!("`{mod_name}` is not a module in this project")),
                 ]);
-            term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, &diag).unwrap();
+            diagnostics.push(diag.clone());
+            sess.emit(&lowerer.files, &diag);
             use_errors = true;
         }
     }
     if use_errors {
-        return None;
+        return session::CompileReport {
+            output: None,
+            files: lowerer.files,
+            diagnostics,
+        };
+    }
+    let duplicate_imports = duplicate_import_diagnostics(&decls, file_id, module_exports);
+    for diag in &duplicate_imports {
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, diag);
+    }
+    if !duplicate_imports.is_empty() {
+        return session::CompileReport {
+            output: None,
+            files: lowerer.files,
+            diagnostics,
+        };
     }
 
     let mut checker = typecheck::TypeChecker::new();
@@ -104,36 +803,48 @@ pub fn compile_with_imports(
     env.extend(imported_schemes.clone());
 
     // Collect the names we still need to seed (not covered by imported_schemes).
-    let import_names: Vec<String> = imports.keys().cloned().collect();
-    let used_modules: std::collections::HashSet<&str> = decls
-        .iter()
-        .filter_map(|d| {
-            if let ast::Declaration::Use { path: (_, m), .. } = d {
-                Some(m.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let qualified_names: Vec<String> = module_exports
-        .iter()
-        .filter(|(m, _)| used_modules.contains(m.as_str()))
-        .flat_map(|(m, fns)| fns.iter().map(move |f| format!("{m}/{f}")))
-        .collect();
-    let unresolved: Vec<String> = import_names
-        .iter()
-        .chain(qualified_names.iter())
-        .filter(|n| !env.contains_key(*n))
-        .cloned()
-        .collect();
+    let symbols = sess.symbol_table(module_exports);
+    let unresolved = resolve::unresolved_env_names(&decls, imports.keys().cloned(), &env, symbols);
     env.extend(typecheck::import_env(&unresolved));
 
     if let Err(err) = checker.check_program(&mut env, &decls, file_id) {
-        let diagnostics = err.0.to_diagnostics(file_id, err.1.span());
-        for diag in diagnostics {
-            term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, &diag).unwrap();
+        let type_diags = err.0.to_diagnostics(file_id, err.1.span());
+        for diag in type_diags {
+            diagnostics.push(diag.clone());
+            sess.emit(&lowerer.files, &diag);
         }
-        return None;
+        return session::CompileReport {
+            output: None,
+            files: lowerer.files,
+            diagnostics,
+        };
+    }
+
+    for (name, span) in unused_function_spans(&decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!("unused function `{name}`"))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this private function is never used"),
+            ]);
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, &diag);
+    }
+    for (name, span) in unused_type_spans(&decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!("unused type `{name}`"))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this private type is never referenced"),
+            ]);
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, &diag);
+    }
+    for diag in
+        unused_unqualified_import_diagnostics(&decls, file_id, module_exports, imported_type_decls)
+    {
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, &diag);
     }
 
     // Build codegen metadata from imported type declarations
@@ -163,7 +874,66 @@ pub fn compile_with_imports(
         imported_constructors,
         imported_field_indices,
     );
-    Some(codegen::emit_module(&module))
+    session::CompileReport {
+        output: Some(codegen::emit_module(&module)),
+        files: lowerer.files,
+        diagnostics,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_imports_report(
+    module_name: &str,
+    source: &str,
+    source_path: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
+    module_aliases: HashMap<String, String>,
+    imported_type_decls: &[ast::TypeDecl],
+    imported_schemes: &typecheck::TypeEnv,
+) -> session::CompileReport {
+    let mut sess = session::CompilerSession::default();
+    compile_with_imports_in_session(
+        &mut sess,
+        module_name,
+        source,
+        source_path,
+        imports,
+        module_exports,
+        module_aliases,
+        imported_type_decls,
+        imported_schemes,
+    )
+}
+
+/// Compile with import resolution.
+/// - `imports`: unqualified name → module (from `use` declarations)
+/// - `module_exports`: module name → exported function names (for validating qualified calls)
+/// - `imported_type_decls`: pub type declarations from imported modules (brings constructors into scope)
+/// - `imported_schemes`: real type schemes from imported modules (keyed by "fn" or "module/fn")
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_imports(
+    module_name: &str,
+    source: &str,
+    source_path: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
+    module_aliases: HashMap<String, String>,
+    imported_type_decls: &[ast::TypeDecl],
+    imported_schemes: &typecheck::TypeEnv,
+) -> Option<String> {
+    let report = compile_with_imports_report(
+        module_name,
+        source,
+        source_path,
+        imports,
+        module_exports,
+        module_aliases,
+        imported_type_decls,
+        imported_schemes,
+    );
+    session::emit_compile_report(&report, true);
+    report.output
 }
 
 /// Extract the names of `pub` top-level functions declared in a source file.
@@ -188,6 +958,25 @@ pub fn exported_names(source: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Returns true when source defines a top-level nullary entrypoint:
+/// `(let main {} ...)`.
+pub fn has_nullary_main(source: &str) -> bool {
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(source).lex();
+    let file_id = lowerer.add_file("scan.zier".into(), source.into());
+    let Ok(sexprs) = crate::sexpr::SExprParser::new(tokens, file_id).parse() else {
+        return false;
+    };
+    let decls = lowerer.lower_file(file_id, &sexprs);
+    decls.into_iter().any(|d| {
+        matches!(
+            d,
+            ast::Declaration::Expression(ast::Expr::LetFunc { name, args, .. })
+            if name == "main" && args.is_empty()
+        )
+    })
 }
 
 /// Extract the modules that a lib.zier publicly re-exports via `(pub use X)`.
@@ -280,6 +1069,10 @@ pub fn infer_module_exports(
     imported_type_decls: &[ast::TypeDecl],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
+    let mut sess = session::CompilerSession::new(session::SessionOptions {
+        emit_diagnostics: false,
+        emit_warnings: false,
+    });
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(source).lex();
     let file_id = lowerer.add_file(format!("{module_name}.zier"), source.to_string());
@@ -301,28 +1094,12 @@ pub fn infer_module_exports(
     }
     env.extend(imported_schemes.clone());
 
-    let import_names: Vec<String> = imports.keys().cloned().collect();
-    let used_modules: std::collections::HashSet<&str> = decls
-        .iter()
-        .filter_map(|d| {
-            if let ast::Declaration::Use { path: (_, m), .. } = d {
-                Some(m.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let qualified_names: Vec<String> = module_exports
-        .iter()
-        .filter(|(m, _)| used_modules.contains(m.as_str()))
-        .flat_map(|(m, fns)| fns.iter().map(move |f| format!("{m}/{f}")))
-        .collect();
-    let unresolved: Vec<String> = import_names
-        .iter()
-        .chain(qualified_names.iter())
-        .filter(|n| !env.contains_key(*n))
-        .cloned()
-        .collect();
+    let unresolved = resolve::unresolved_env_names(
+        &decls,
+        imports.keys().cloned(),
+        &env,
+        sess.symbol_table(module_exports),
+    );
     env.extend(typecheck::import_env(&unresolved));
 
     // Also seed type def spans from imported type decls (for better errors — optional)
@@ -421,5 +1198,340 @@ mod tests {
             &HashMap::new(),
         );
         assert!(with_use_result.is_some());
+    }
+
+    #[test]
+    fn duplicate_unqualified_imports_error() {
+        let mut module_exports = HashMap::new();
+        module_exports.insert("a".to_string(), vec!["map".to_string()]);
+        module_exports.insert("b".to_string(), vec!["map".to_string()]);
+
+        let src = "(use a [map])\n(use b [map])\n(let main {} map)";
+        let result = compile_with_imports(
+            "main",
+            src,
+            "main.zier",
+            HashMap::new(),
+            &module_exports,
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn duplicate_module_use_without_unqualified_imports_is_allowed() {
+        let mut module_exports = HashMap::new();
+        module_exports.insert("io".to_string(), vec!["println".to_string()]);
+
+        let src = "(use std/io)\n(use std/io)\n(let main {} (io/println \"Hey!\"))";
+        let result = compile_with_imports(
+            "main",
+            src,
+            "main.zier",
+            HashMap::new(),
+            &module_exports,
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn wildcard_import_enables_unqualified_call() {
+        let mut module_exports = HashMap::new();
+        module_exports.insert("math".to_string(), vec!["inc".to_string()]);
+        let mut imports = HashMap::new();
+        imports.insert("inc".to_string(), "math".to_string());
+
+        let src = "(use math [*])\n(let main {} (inc 1))";
+        let result = compile_with_imports(
+            "main",
+            src,
+            "main.zier",
+            imports,
+            &module_exports,
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn local_shadowing_beats_unqualified_import() {
+        let mut module_exports = HashMap::new();
+        module_exports.insert("m".to_string(), vec!["x".to_string()]);
+        let mut imports = HashMap::new();
+        imports.insert("x".to_string(), "m".to_string());
+
+        let src = "(use m [x])\n(let main {x} x)";
+        let result = compile_with_imports(
+            "main",
+            src,
+            "main.zier",
+            imports,
+            &module_exports,
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn pub_reexports_only_include_pub_use_decls() {
+        let src = "(pub use std/io)\n(use std/result)\n(pub use math)";
+        let reexports = pub_reexports(src);
+        assert_eq!(reexports, vec!["io".to_string(), "math".to_string()]);
+    }
+
+    #[test]
+    fn session_can_suppress_warning_emission() {
+        let mut sess = session::CompilerSession::new(session::SessionOptions {
+            emit_diagnostics: true,
+            emit_warnings: false,
+        });
+        let src = "(let main {} 0)\n(let dead {} 1)";
+        let result = compile_with_imports_in_session(
+            &mut sess,
+            "main",
+            src,
+            "main.zier",
+            HashMap::new(),
+            &HashMap::new(),
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(result.output.is_some());
+        assert_eq!(sess.emitted_warnings, 0);
+    }
+
+    #[test]
+    fn session_still_emits_errors_when_warnings_disabled() {
+        let mut sess = session::CompilerSession::new(session::SessionOptions {
+            emit_diagnostics: true,
+            emit_warnings: false,
+        });
+        let src = "(let main {} unknown)";
+        let result = compile_with_imports_in_session(
+            &mut sess,
+            "main",
+            src,
+            "main.zier",
+            HashMap::new(),
+            &HashMap::new(),
+            HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(result.output.is_none());
+        assert!(sess.emitted_errors > 0);
+    }
+
+    #[test]
+    fn unused_function_analysis_marks_private_unreachable_only() {
+        let src = "(let main {} (live))\n(let live {} (helper))\n(let helper {} 1)\n(let dead {} 42)\n(pub let api {} 0)";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut unused: Vec<String> = unused_function_spans(&decls)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        unused.sort();
+        assert_eq!(unused, vec!["dead".to_string()]);
+    }
+
+    #[test]
+    fn unqualified_import_warnings_skip_qualified_only_use() {
+        let src = "(use std/io)\n(let main {} ())";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert("io".to_string(), vec!["println".to_string()]);
+        let warnings = unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn unqualified_import_warnings_flag_unused_specific_and_wildcard() {
+        let src =
+            "(use std/io)\n(use std/result [Result bind])\n(use std/option [*])\n(let main {} ())";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert("io".to_string(), vec!["println".to_string()]);
+        module_exports.insert(
+            "result".to_string(),
+            vec!["Result".to_string(), "bind".to_string()],
+        );
+        module_exports.insert(
+            "option".to_string(),
+            vec!["Some".to_string(), "None".to_string()],
+        );
+        let warnings = unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+        assert_eq!(warnings.len(), 2);
+        let messages: Vec<String> = warnings.into_iter().map(|d| d.message).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("unused unqualified imports from `result`")),
+            "missing specific import warning: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("unused wildcard import from `option`")),
+            "missing wildcard import warning: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn unqualified_import_warnings_count_type_decl_usage() {
+        let src = "(use std/option [Option])\n(type Attributes ((:max_age ~ Option Int)))\n(let main {} ())";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "option".to_string(),
+            vec!["Option".to_string(), "Some".to_string(), "None".to_string()],
+        );
+        let warnings = unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+        assert!(
+            warnings.is_empty(),
+            "expected no unused import warnings, got: {:?}",
+            warnings
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unqualified_import_warnings_count_variant_constructor_usage_for_type_import() {
+        let src = "(use std/result [Result])\n(let main {} (Ok 1))";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "result".to_string(),
+            vec!["Result".to_string(), "bind".to_string()],
+        );
+        let imported_type_decls =
+            exported_type_decls("(pub type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))");
+        let warnings = unused_unqualified_import_diagnostics(
+            &decls,
+            file_id,
+            &module_exports,
+            &imported_type_decls,
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no unused import warning for type import used via constructors, got: {:?}",
+            warnings
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unqualified_import_warnings_count_record_constructor_usage_for_type_import() {
+        let src = "(use std/unknown [DecodeError])\n(let main {} (DecodeError :expected \"Int\" :found \"String\"))";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert("unknown".to_string(), vec!["DecodeError".to_string()]);
+        let imported_type_decls =
+            exported_type_decls("(pub type DecodeError ((:expected ~ String) (:found ~ String)))");
+        let warnings = unused_unqualified_import_diagnostics(
+            &decls,
+            file_id,
+            &module_exports,
+            &imported_type_decls,
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no unused import warning for record type import used via construction, got: {:?}",
+            warnings
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unused_type_analysis_marks_private_unreferenced_type() {
+        let src = "(type Attributes ((:max_age ~ Int)))\n(let main {} ())";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut unused: Vec<String> = unused_type_spans(&decls)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        unused.sort();
+        assert_eq!(unused, vec!["Attributes".to_string()]);
+    }
+
+    #[test]
+    fn unused_type_analysis_counts_variant_constructor_usage() {
+        let src = "(type Flag (On Off))\n(let main {} On)";
+        let mut lowerer = lower::Lowerer::new();
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let file_id = lowerer.add_file("scan.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        assert!(
+            unused_type_spans(&decls).is_empty(),
+            "expected type to be considered used via constructor"
+        );
     }
 }

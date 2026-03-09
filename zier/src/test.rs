@@ -5,6 +5,8 @@ use eyre::Context;
 use crate::{
     TARGET_DIR, TEST_BUILD_DIR,
     build::{ErlSources, generate_erl_sources},
+    resolve::ResolveContext,
+    ui,
     utils::find_zier_files,
 };
 
@@ -27,13 +29,13 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
     let test_dir = project_dir.join(TEST_DIR);
     if !test_dir.exists() {
-        println!("no tests/ directory found");
+        ui::warn("no tests/ directory found");
         return Ok(());
     }
 
     let test_files = find_zier_files(&test_dir);
     if test_files.is_empty() {
-        println!("no test files found in tests/");
+        ui::warn("no test files found in tests/");
         return Ok(());
     }
 
@@ -71,75 +73,40 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
     // Compile each test file
     let mut had_error = false;
+    let resolver = ResolveContext {
+        all_module_schemes: &all_module_schemes,
+        module_type_decls: &module_type_decls,
+        std_aliases: &std_aliases,
+    };
     // (module_name, Vec<(display_name, erlang_fn_name)>)
     let mut test_fns_by_module: Vec<(String, Vec<(String, String)>)> = Vec::new();
 
     for (module_name, source) in &test_module_sources {
-        let mut imports: HashMap<String, String> = HashMap::new();
-        let mut imported_schemes: zierc::typecheck::TypeEnv = HashMap::new();
+        let resolved = resolver.resolve_for_source(source, &all_exports);
 
-        // Resolve imports: std modules + src modules
-        for (_, mod_name, unqualified) in zierc::used_modules(source) {
-            let erlang_name = std_mods
-                .iter()
-                .find(|(user, _, _)| user == &mod_name)
-                .map(|(_, erl, _)| erl.clone())
-                .unwrap_or_else(|| mod_name.clone());
-
-            if let Some(exports) = all_exports.get(&mod_name) {
-                for fn_name in exports {
-                    if unqualified.includes(fn_name) {
-                        imports.insert(fn_name.clone(), erlang_name.clone());
-                    }
-                }
-            }
-
-            if let Some(mod_schemes) = all_module_schemes.get(&mod_name) {
-                for (fn_name, scheme) in mod_schemes {
-                    if unqualified.includes(fn_name) {
-                        imported_schemes.insert(fn_name.clone(), scheme.clone());
-                    }
-                    imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
-                }
-            }
-        }
-
-        let module_aliases: HashMap<String, String> = std_mods
-            .iter()
-            .map(|(user, erlang, _)| (user.clone(), erlang.clone()))
-            .collect();
-
-        // Collect type decls from referenced modules
-        let mut referenced_modules: std::collections::HashSet<String> = zierc::used_modules(source)
-            .into_iter()
-            .map(|(_, mod_name, _)| mod_name)
-            .collect();
-        for tok in zierc::lexer::Lexer::new(source).lex() {
-            if let zierc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind {
-                referenced_modules.insert(module);
-            }
-        }
-        let imported_type_decls: Vec<zierc::ast::TypeDecl> = referenced_modules
-            .iter()
-            .flat_map(|mod_name| module_type_decls.get(mod_name).cloned().unwrap_or_default())
-            .collect();
-
-        match zierc::compile_with_imports(
+        let report = zierc::compile_with_imports_report(
             module_name,
             source,
             &format!("tests/{module_name}.zier"),
-            imports,
+            resolved.imports,
             &all_exports,
-            module_aliases,
-            &imported_type_decls,
-            &imported_schemes,
-        ) {
-            Some(erl_src) => {
+            resolved.module_aliases,
+            &resolved.imported_type_decls,
+            &resolved.imported_schemes,
+        );
+        zierc::session::emit_compile_report_with_color(
+            &report,
+            true,
+            ui::diagnostic_color_choice(),
+        );
+        match report.output {
+            Some(erl_src) if !report.has_errors() => {
                 let erl_path = build_dir.join(format!("{module_name}.erl"));
-                std::fs::write(&erl_path, erl_src).expect("could not write .erl");
+                std::fs::write(&erl_path, erl_src)
+                    .with_context(|| format!("could not write {}", erl_path.display()))?;
                 erl_paths.push(erl_path);
             }
-            None => {
+            _ => {
                 had_error = true;
             }
         }
@@ -152,7 +119,9 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     }
 
     if had_error {
-        std::process::exit(1);
+        return Err(eyre::eyre!(
+            "test compilation failed; see diagnostics above"
+        ));
     }
 
     // Compile std modules needed by test files (only those referenced via `use`)
@@ -209,7 +178,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             })
             .collect();
 
-        if let Some(erl_src) = zierc::compile_with_imports(
+        let report = zierc::compile_with_imports_report(
             erlang_name,
             source,
             &format!("{erlang_name}.zier"),
@@ -218,10 +187,28 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             std_aliases.clone(),
             &std_imported_type_decls,
             &std_imported_schemes,
-        ) {
-            std::fs::write(&erl_path, erl_src).expect("could not write .erl");
-            erl_paths.push(erl_path);
+        );
+        zierc::session::emit_compile_report_with_color(
+            &report,
+            true,
+            ui::diagnostic_color_choice(),
+        );
+        if report.has_errors() {
+            had_error = true;
+            continue;
         }
+        if let Some(erl_src) = report.output {
+            std::fs::write(&erl_path, erl_src)
+                .with_context(|| format!("could not write {}", erl_path.display()))?;
+            erl_paths.push(erl_path);
+        } else {
+            had_error = true;
+        }
+    }
+    if had_error {
+        return Err(eyre::eyre!(
+            "test compilation failed; see diagnostics above"
+        ));
     }
 
     // Copy any hand-written .erl std helpers needed by test files into the build dir
@@ -231,7 +218,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             let file_name = file.path().file_name().unwrap();
             let dest = build_dir.join(file_name);
             if !dest.exists() {
-                std::fs::write(&dest, file.contents()).expect("could not write std .erl file");
+                std::fs::write(&dest, file.contents())
+                    .with_context(|| format!("could not write {}", dest.display()))?;
                 erl_paths.push(dest);
             }
         }
@@ -239,7 +227,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
     let total: usize = test_fns_by_module.iter().map(|(_, fns)| fns.len()).sum();
     if total == 0 {
-        println!("no test declarations found");
+        ui::warn("no test declarations found");
         return Ok(());
     }
 
@@ -255,19 +243,20 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         .arg(&build_dir)
         .args(&erl_paths)
         .output()
-        .unwrap_or_else(|e| {
-            eprintln!("error: could not run erlc: {e}");
-            std::process::exit(1);
-        });
+        .context("could not run erlc")?;
 
     if !erlc.status.success() {
-        eprintln!("erlc failed:");
-        eprintln!("{}", String::from_utf8_lossy(&erlc.stderr));
-        std::process::exit(1);
+        return Err(eyre::eyre!(
+            "erlc failed:\n{}",
+            String::from_utf8_lossy(&erlc.stderr)
+        ));
     }
 
     // Run the test runner
-    println!("running {total} test{}", if total == 1 { "" } else { "s" });
+    ui::info(&format!(
+        "running {total} test{}",
+        if total == 1 { "" } else { "s" }
+    ));
     let status = Command::new("erl")
         .arg("-noshell")
         .arg("-pz")
@@ -275,12 +264,18 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         .arg("-eval")
         .arg("zier_test_runner:run().")
         .status()
-        .unwrap_or_else(|e| {
-            eprintln!("error: could not run erl: {e}");
-            std::process::exit(1);
-        });
+        .context("could not run erl")?;
 
-    std::process::exit(status.code().unwrap_or(1));
+    if !status.success() {
+        return Err(eyre::eyre!(
+            "tests failed with status {}",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string())
+        ));
+    }
+    Ok(())
 }
 
 fn generate_runner(test_fns_by_module: &[(String, Vec<(String, String)>)]) -> String {

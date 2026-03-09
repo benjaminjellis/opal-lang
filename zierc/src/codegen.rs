@@ -196,47 +196,95 @@ fn lower_extern_let(
 // ─── Expression lowering ────────────────────────────────────────────────────
 
 fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
+    let renames = HashMap::new();
+    let mut fresh_idx = 0usize;
+    lower_expr_with_renames(expr, ctx, &renames, &mut fresh_idx)
+}
+
+fn lower_expr_with_renames(
+    expr: &ast::Expr,
+    ctx: &Ctx,
+    renames: &HashMap<String, String>,
+    fresh_idx: &mut usize,
+) -> ir::Expr {
     match expr {
         ast::Expr::Literal(lit, _) => lower_literal(lit),
 
-        ast::Expr::Variable(name, _) => lower_variable(name, ctx),
+        ast::Expr::Variable(name, _) => lower_variable(name, ctx, renames),
 
-        ast::Expr::List(items, _) => {
-            ir::Expr::List(items.iter().map(|e| lower_expr(e, ctx)).collect())
-        }
+        ast::Expr::List(items, _) => ir::Expr::List(
+            items
+                .iter()
+                .map(|e| lower_expr_with_renames(e, ctx, renames, fresh_idx))
+                .collect(),
+        ),
 
         ast::Expr::LetLocal {
             name, value, body, ..
-        } => ir::Expr::Let(
-            var_name(name),
-            Box::new(lower_expr(value, ctx)),
-            Box::new(lower_expr(body, ctx)),
-        ),
+        } => {
+            let value_ir = lower_expr_with_renames(value, ctx, renames, fresh_idx);
+            let mut body_renames = renames.clone();
+            body_renames.remove(name);
+            let body_ir = lower_expr_with_renames(body, ctx, &body_renames, fresh_idx);
+            ir::Expr::Let(var_name(name), Box::new(value_ir), Box::new(body_ir))
+        }
 
         ast::Expr::If {
             cond, then, els, ..
         } => ir::Expr::Case(
-            Box::new(lower_expr(cond, ctx)),
+            Box::new(lower_expr_with_renames(cond, ctx, renames, fresh_idx)),
             vec![
-                (ir::Pattern::Atom("true".into()), lower_expr(then, ctx)),
-                (ir::Pattern::Any, lower_expr(els, ctx)),
+                (
+                    ir::Pattern::Atom("true".into()),
+                    lower_expr_with_renames(then, ctx, renames, fresh_idx),
+                ),
+                (
+                    ir::Pattern::Any,
+                    lower_expr_with_renames(els, ctx, renames, fresh_idx),
+                ),
             ],
         ),
 
         ast::Expr::Match { targets, arms, .. } => {
             let scrutinee = if targets.len() == 1 {
-                lower_expr(&targets[0], ctx)
+                lower_expr_with_renames(&targets[0], ctx, renames, fresh_idx)
             } else {
-                ir::Expr::Tuple(targets.iter().map(|t| lower_expr(t, ctx)).collect())
+                ir::Expr::Tuple(
+                    targets
+                        .iter()
+                        .map(|t| lower_expr_with_renames(t, ctx, renames, fresh_idx))
+                        .collect(),
+                )
             };
 
             let mut ir_arms = Vec::new();
             for (patterns, body) in arms {
-                let body_ir = lower_expr(body, ctx);
+                let mut arm_renames = renames.clone();
+                let mut pattern_renames: HashMap<String, String> = HashMap::new();
+                for pat in patterns {
+                    let mut names = Vec::new();
+                    collect_pattern_vars(pat, &mut names);
+                    for name in names {
+                        if let std::collections::hash_map::Entry::Vacant(v) =
+                            pattern_renames.entry(name.clone())
+                        {
+                            let fresh = format!("{}__p{}", var_name(&name), *fresh_idx);
+                            *fresh_idx += 1;
+                            v.insert(fresh);
+                        }
+                    }
+                }
+                arm_renames.extend(pattern_renames.clone());
+                let body_ir = lower_expr_with_renames(body, ctx, &arm_renames, fresh_idx);
                 let pat = if targets.len() == 1 {
-                    lower_pattern(&patterns[0], ctx)
+                    lower_pattern(&patterns[0], ctx, &pattern_renames)
                 } else {
-                    ir::Pattern::Tuple(patterns.iter().map(|p| lower_pattern(p, ctx)).collect())
+                    ir::Pattern::Tuple(
+                        patterns
+                            .iter()
+                            .map(|p| lower_pattern(p, ctx, &pattern_renames))
+                            .collect(),
+                    )
                 };
                 expand_or_pattern(pat, body_ir, &mut ir_arms);
             }
@@ -245,11 +293,15 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
         }
 
         ast::Expr::Lambda { args, body, .. } => {
-            let body_ir = lower_expr(body, ctx);
+            let mut body_renames = renames.clone();
+            for arg in args {
+                body_renames.remove(arg);
+            }
+            let body_ir = lower_expr_with_renames(body, ctx, &body_renames, fresh_idx);
             make_lambda(args, body_ir)
         }
 
-        ast::Expr::Call { func, args, .. } => lower_call(func, args, ctx),
+        ast::Expr::Call { func, args, .. } => lower_call(func, args, ctx, renames, fresh_idx),
 
         ast::Expr::FieldAccess { field, record, .. } => {
             // Emit erlang:element(N, Record) where N is the 1-based field index.
@@ -257,7 +309,10 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
             ir::Expr::RemoteCall(
                 "erlang".into(),
                 "element".into(),
-                vec![ir::Expr::Int(idx as i64), lower_expr(record, ctx)],
+                vec![
+                    ir::Expr::Int(idx as i64),
+                    lower_expr_with_renames(record, ctx, renames, fresh_idx),
+                ],
             )
         }
 
@@ -266,7 +321,11 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
             // Without type info we use declaration order as given at the call site
             let tag = ir::Expr::Atom(name.to_lowercase());
             let mut items = vec![tag];
-            items.extend(fields.iter().map(|(_, e)| lower_expr(e, ctx)));
+            items.extend(
+                fields
+                    .iter()
+                    .map(|(_, e)| lower_expr_with_renames(e, ctx, renames, fresh_idx)),
+            );
             ir::Expr::Tuple(items)
         }
 
@@ -286,10 +345,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
                 ir::Expr::RemoteCall(erl_module, function.clone(), vec![])
             } else {
                 // First arg goes into the remote call, rest chain as curried calls
-                let first = lower_expr(&args[0], ctx);
+                let first = lower_expr_with_renames(&args[0], ctx, renames, fresh_idx);
                 let mut result = ir::Expr::RemoteCall(erl_module, function.clone(), vec![first]);
                 for arg in &args[1..] {
-                    result = ir::Expr::Call(Box::new(result), Box::new(lower_expr(arg, ctx)));
+                    result = ir::Expr::Call(
+                        Box::new(result),
+                        Box::new(lower_expr_with_renames(arg, ctx, renames, fresh_idx)),
+                    );
                 }
                 result
             }
@@ -299,7 +361,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
     }
 }
 
-fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
+fn lower_call(
+    func: &ast::Expr,
+    args: &[ast::Expr],
+    ctx: &Ctx,
+    renames: &HashMap<String, String>,
+    fresh_idx: &mut usize,
+) -> ir::Expr {
     if let ast::Expr::Variable(name, _) = func {
         // Binary operator
         if args.len() == 2
@@ -307,8 +375,8 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
         {
             return ir::Expr::BinOp(
                 erl_op.to_string(),
-                Box::new(lower_expr(&args[0], ctx)),
-                Box::new(lower_expr(&args[1], ctx)),
+                Box::new(lower_expr_with_renames(&args[0], ctx, renames, fresh_idx)),
+                Box::new(lower_expr_with_renames(&args[1], ctx, renames, fresh_idx)),
             );
         }
 
@@ -316,7 +384,10 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
         if args.len() == 1
             && let Some(erl_op) = unary_op(name)
         {
-            return ir::Expr::UnOp(erl_op.to_string(), Box::new(lower_expr(&args[0], ctx)));
+            return ir::Expr::UnOp(
+                erl_op.to_string(),
+                Box::new(lower_expr_with_renames(&args[0], ctx, renames, fresh_idx)),
+            );
         }
 
         // Constructor application: Ok x → {ok, X}
@@ -325,7 +396,10 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
         {
             let tag = ir::Expr::Atom(name.to_lowercase());
             let mut items = vec![tag];
-            items.extend(args.iter().map(|a| lower_expr(a, ctx)));
+            items.extend(
+                args.iter()
+                    .map(|a| lower_expr_with_renames(a, ctx, renames, fresh_idx)),
+            );
             return ir::Expr::Tuple(items);
         }
 
@@ -335,10 +409,13 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
             if args.is_empty() {
                 return ir::Expr::RemoteCall(module, name.clone(), vec![]);
             }
-            let first = lower_expr(&args[0], ctx);
+            let first = lower_expr_with_renames(&args[0], ctx, renames, fresh_idx);
             let mut result = ir::Expr::RemoteCall(module, name.clone(), vec![first]);
             for arg in &args[1..] {
-                result = ir::Expr::Call(Box::new(result), Box::new(lower_expr(arg, ctx)));
+                result = ir::Expr::Call(
+                    Box::new(result),
+                    Box::new(lower_expr_with_renames(arg, ctx, renames, fresh_idx)),
+                );
             }
             return result;
         }
@@ -352,14 +429,20 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
             let zier_arity = ctx.fn_arities.get(name.as_str()).copied().unwrap_or(0);
             // Full application of a multi-arg function → direct N-arity call (enables TCO)
             if zier_arity >= 2 && args.len() == zier_arity {
-                let lowered = args.iter().map(|a| lower_expr(a, ctx)).collect();
+                let lowered = args
+                    .iter()
+                    .map(|a| lower_expr_with_renames(a, ctx, renames, fresh_idx))
+                    .collect();
                 return ir::Expr::LocalCallMulti(name.clone(), lowered);
             }
             // Partial application or single-arg — use curried form
-            let first = lower_expr(&args[0], ctx);
+            let first = lower_expr_with_renames(&args[0], ctx, renames, fresh_idx);
             let mut result = ir::Expr::LocalCall(name.clone(), Box::new(first));
             for arg in &args[1..] {
-                result = ir::Expr::Call(Box::new(result), Box::new(lower_expr(arg, ctx)));
+                result = ir::Expr::Call(
+                    Box::new(result),
+                    Box::new(lower_expr_with_renames(arg, ctx, renames, fresh_idx)),
+                );
             }
             return result;
         }
@@ -369,18 +452,24 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
     // 0-arg call on an arbitrary expr → call with unit
     if args.is_empty() {
         return ir::Expr::Call(
-            Box::new(lower_expr(func, ctx)),
+            Box::new(lower_expr_with_renames(func, ctx, renames, fresh_idx)),
             Box::new(ir::Expr::Atom("unit".into())),
         );
     }
-    let mut result = lower_expr(func, ctx);
+    let mut result = lower_expr_with_renames(func, ctx, renames, fresh_idx);
     for arg in args {
-        result = ir::Expr::Call(Box::new(result), Box::new(lower_expr(arg, ctx)));
+        result = ir::Expr::Call(
+            Box::new(result),
+            Box::new(lower_expr_with_renames(arg, ctx, renames, fresh_idx)),
+        );
     }
     result
 }
 
-fn lower_variable(name: &str, ctx: &Ctx) -> ir::Expr {
+fn lower_variable(name: &str, ctx: &Ctx, renames: &HashMap<String, String>) -> ir::Expr {
+    if let Some(mapped) = renames.get(name) {
+        return ir::Expr::Var(mapped.clone());
+    }
     // Nullary constructor → atom
     if let Some(&0) = ctx.constructors.get(name) {
         return ir::Expr::Atom(name.to_lowercase());
@@ -419,10 +508,14 @@ fn lower_literal(lit: &ast::Literal) -> ir::Expr {
     }
 }
 
-fn lower_pattern(pat: &ast::Pattern, ctx: &Ctx) -> ir::Pattern {
+fn lower_pattern(pat: &ast::Pattern, ctx: &Ctx, renames: &HashMap<String, String>) -> ir::Pattern {
     match pat {
         ast::Pattern::Any(_) => ir::Pattern::Any,
-        ast::Pattern::Variable(name, _) => ir::Pattern::Var(var_name(name)),
+        ast::Pattern::Variable(name, _) => renames
+            .get(name)
+            .cloned()
+            .map(ir::Pattern::Var)
+            .unwrap_or_else(|| ir::Pattern::Var(var_name(name))),
         ast::Pattern::Literal(lit, _) => match lit {
             ast::Literal::Int(n) => ir::Pattern::Int(*n),
             ast::Literal::Float(f) => ir::Pattern::Float(*f),
@@ -437,22 +530,47 @@ fn lower_pattern(pat: &ast::Pattern, ctx: &Ctx) -> ir::Pattern {
             } else {
                 let tag = ir::Pattern::Atom(name.to_lowercase());
                 let mut items = vec![tag];
-                items.extend(sub_pats.iter().map(|p| lower_pattern(p, ctx)));
+                items.extend(sub_pats.iter().map(|p| lower_pattern(p, ctx, renames)));
                 ir::Pattern::Tuple(items)
             }
         }
         ast::Pattern::EmptyList(_) => ir::Pattern::List(vec![]),
 
         ast::Pattern::Cons(head, tail, _) => ir::Pattern::Cons(
-            Box::new(lower_pattern(head, ctx)),
-            Box::new(lower_pattern(tail, ctx)),
+            Box::new(lower_pattern(head, ctx, renames)),
+            Box::new(lower_pattern(tail, ctx, renames)),
         ),
 
         ast::Pattern::Or(pats, _) => {
             // Or-patterns are expanded by the caller via expand_or_pattern
             // If we get here directly, just use the first alternative
-            lower_pattern(&pats[0], ctx)
+            lower_pattern(&pats[0], ctx, renames)
         }
+    }
+}
+
+fn collect_pattern_vars(pat: &ast::Pattern, out: &mut Vec<String>) {
+    match pat {
+        ast::Pattern::Variable(name, _) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        ast::Pattern::Constructor(_, args, _) => {
+            for arg in args {
+                collect_pattern_vars(arg, out);
+            }
+        }
+        ast::Pattern::Or(pats, _) => {
+            for p in pats {
+                collect_pattern_vars(p, out);
+            }
+        }
+        ast::Pattern::Cons(head, tail, _) => {
+            collect_pattern_vars(head, out);
+            collect_pattern_vars(tail, out);
+        }
+        ast::Pattern::Any(_) | ast::Pattern::Literal(_, _) | ast::Pattern::EmptyList(_) => {}
     }
 }
 
@@ -465,7 +583,7 @@ fn expand_or_pattern(pat: ir::Pattern, body: ir::Expr, arms: &mut Vec<(ir::Patte
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Build a curried lambda: `(fn {a b c} body)` → `fun(A) -> fun(B) -> fun(C) -> body end end end`
+/// Build a curried lambda: `(f {a b c} -> body)` → `fun(A) -> fun(B) -> fun(C) -> body end end end`
 fn make_lambda(args: &[String], body: ir::Expr) -> ir::Expr {
     if args.is_empty() {
         ir::Expr::Fun("_Unit".to_string(), Box::new(body))

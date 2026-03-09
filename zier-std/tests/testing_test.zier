@@ -1,0 +1,22 @@
+(use std/testing)
+(use std/result [Result])
+(use std/string)
+(use std/testing [assert_eq assert_ne])
+
+(test
+  "testing/assert success"
+  (testing/assert True))
+
+(test
+  "testing/assert failure"
+  (assert_eq (testing/assert False) (Error "assertion failed")))
+
+(test
+  "testing/assert_ne success"
+  (assert_ne 1 2))
+
+(test
+  "testing/assert_ne failure"
+  (match (assert_ne "same" "same")
+    (Error msg) ~> (testing/assert (string/contains msg "expected values to differ"))
+    _ ~> (Error "assert_ne should have failed")))
