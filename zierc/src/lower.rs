@@ -694,7 +694,7 @@ impl Lowerer {
             return None;
         }
 
-        let (args, arg_spans) = match &items[1] {
+        let (args, arg_spans): (Vec<_>, Vec<_>) = match &items[1] {
             SExpr::Curly(params, _) => params
                 .iter()
                 .filter_map(|p| {
@@ -721,6 +721,16 @@ impl Lowerer {
                 return None;
             }
         };
+
+        for (arg, span) in args.iter().zip(&arg_spans) {
+            if arg == "f" {
+                self.error(
+                        Diagnostic::error()
+                            .with_message("invalid argument name, 'f' is a reserved keyword for anonymous functions")
+                            .with_labels(vec![Label::primary(file_id, span.clone())]),
+                    )
+            }
+        }
 
         if !matches!(
             items.get(2),
@@ -1986,6 +1996,7 @@ impl Lowerer {
                 // STRICT ENFORCEMENT: The next item MUST be Curly brackets {}
                 let (args, arg_spans) = if let Some(SExpr::Curly(params, _)) = items.get(cursor) {
                     let mut arg_names = Vec::new();
+
                     let mut arg_spans = Vec::new();
                     for p in params {
                         if let SExpr::Atom(t) = p {
@@ -2007,6 +2018,18 @@ impl Lowerer {
                 );
                     return None;
                 };
+
+                for (arg, span) in args.iter().zip(&arg_spans) {
+                    // we should not allow 'f' as a arg name because it's reserve for anon
+                    // functions
+                    if arg == "f" {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message("invalid argument name, 'f' is a reserved keyword for anonymous functions")
+                                .with_labels(vec![Label::primary(file_id, span.clone())]),
+                        )
+                    }
+                }
 
                 // Collect all body expressions — implicit sequencing like Clojure
                 let body_sexprs = &items[cursor..];
@@ -3019,6 +3042,30 @@ mod tests {
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty());
         assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_let_function_rejects_f_as_argument_name() {
+        let (mut lowerer, file_id, sexprs) = setup("(let main {f} f)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty());
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "invalid argument name, 'f' is a reserved keyword for anonymous functions"
+        );
+    }
+
+    #[test]
+    fn test_lambda_rejects_f_as_argument_name() {
+        let (mut lowerer, file_id, sexprs) = setup("(f {f} -> f)");
+        let result = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(result.is_none());
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "invalid argument name, 'f' is a reserved keyword for anonymous functions"
+        );
     }
 
     #[test]

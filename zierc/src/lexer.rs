@@ -33,9 +33,13 @@ pub struct Token {
 #[derive(Logos, Clone, Debug, PartialEq)]
 #[logos(skip r"[ \t\r\n]+")]
 pub enum TokenKind {
+    /// A doc comment: `;;;` to end of line. Preserved in the token stream so
+    /// that tooling can attach it to the following declaration.
+    #[regex(r";;;[^\n]*", allow_greedy = true)]
+    DocComment,
     /// A line comment: `;;` to end of line. Preserved in the token stream so
     /// that formatters and tooling can see comments; the parser filters these out.
-    #[regex(r";[^\n]*", allow_greedy = true)]
+    #[regex(r";;[^\n]*", allow_greedy = true)]
     Comment,
     // Structural symbols
     #[token("(")]
@@ -132,6 +136,7 @@ pub enum TokenKind {
 impl TokenKind {
     pub(crate) fn name(&self) -> &str {
         match self {
+            TokenKind::DocComment => "doc comment",
             TokenKind::Comment => "comment",
             TokenKind::LRound => "opening bracket '('",
             TokenKind::RRound => "closing bracket ')'",
@@ -441,12 +446,13 @@ mod tests {
     fn comments_are_emitted_as_tokens() {
         let source = r#"
             ;; this is a comment
+            ;;; this is docs
             42
             ;; another comment
         "#;
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
-        assert_eq!(tokens, vec![Comment, Int(42), Comment]);
+        assert_eq!(tokens, vec![Comment, DocComment, Int(42), Comment]);
     }
 
     #[test]
@@ -455,6 +461,14 @@ mod tests {
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
         assert_eq!(tokens, vec![Bool(true), Comment, Bool(false)]);
+    }
+
+    #[test]
+    fn doc_comments_are_emitted_as_tokens() {
+        let source = ";;; hello\n;;; world\n42";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![DocComment, DocComment, Int(42)]);
     }
 
     #[test]

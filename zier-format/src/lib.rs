@@ -19,12 +19,13 @@ mod tests;
 /// fails (so the formatter is safe to call unconditionally).
 pub fn format(source: &str, width: usize) -> String {
     let mut lowerer = zierc::lower::Lowerer::new();
-    // Lex once — the full token stream includes Comment tokens.
+    // Lex once — the full token stream includes comment/doc-comment tokens.
     let tokens = zierc::lexer::Lexer::new(source).lex();
     let file_id = lowerer.add_file("fmt.zier".into(), source.into());
 
-    // SExprParser::new filters Comment tokens out internally, so the parser
-    // sees a clean stream. We keep the full `tokens` for the formatter.
+    // SExprParser::new filters comment/doc-comment tokens out internally, so
+    // the parser sees a clean stream. We keep the full `tokens` for the
+    // formatter.
     let sexprs = match zierc::sexpr::SExprParser::new(tokens.clone(), file_id).parse() {
         Ok(s) => s,
         Err(_) => return source.to_string(),

@@ -1,35 +1,35 @@
-;; list.zier — list helpers backed by Erlang lists
+;;; list.zier — list helpers backed by Erlang lists
 (use option)
 
-;; Returns the number of elements in the list.
+;;; Returns the number of elements in the list.
 (pub extern let length ~ ((List 'a) -> Int) erlang/length)
 
-;; Returns a new list with the elements in reverse order.
+;;; Returns a new list with the elements in reverse order.
 (pub extern let reverse ~ ((List 'a) -> (List 'a)) lists/reverse)
 
-;; Concatenates two lists.
+;;; Concatenates two lists.
 (pub extern let append ~ ((List 'a) -> (List 'a) -> (List 'a)) lists/append)
 
-;; Returns the Nth element of the list (0-indexed), or None if out of bounds.
+;;; Returns the Nth element of the list (0-indexed), or None if out of bounds.
 (pub extern let nth ~ (Int -> (List 'a) -> Option 'a) zier_list_helpers/nth)
 
-;; Returns true if the element is in the list.
+;;; Returns true if the element is in the list.
 (pub extern let member ~ ('a -> (List 'a) -> Bool) lists/member)
 
-;; Applies a function to each element, returning a new list.
+;;; Applies a function to each element, returning a new list.
 (pub extern let map ~ (('a -> 'b) -> (List 'a) -> (List 'b)) lists/map)
 
-;; Returns a list of elements for which the predicate returns true.
+;;; Returns a list of elements for which the predicate returns true.
 (pub extern let filter ~ (('a -> Bool) -> (List 'a) -> (List 'a)) lists/filter)
 
-;; Left fold: foldl f acc [x1 x2 x3] = f x3 (f x2 (f x1 acc))
+;;; Left fold: foldl f acc [x1 x2 x3] = f x3 (f x2 (f x1 acc))
 (pub extern let foldl ~ (('a -> 'b -> 'b) -> 'b -> (List 'a) -> 'b) zier_list_helpers/foldl)
 
-;; Right fold: foldr f acc [x1 x2 x3] = f x1 (f x2 (f x3 acc))
+;;; Right fold: foldr f acc [x1 x2 x3] = f x1 (f x2 (f x3 acc))
 (pub extern let foldr ~ (('a -> 'b -> 'b) -> 'b -> (List 'a) -> 'b) zier_list_helpers/foldr)
 
-;; Returns a sorted list (uses the natural Erlang term ordering).
+;;; Returns a sorted list (uses the natural Erlang term ordering).
 (pub extern let sort ~ ((List 'a) -> (List 'a)) lists/sort)
 
-;; Flattens a list of lists into a single list.
+;;; Flattens a list of lists into a single list.
 (pub extern let flatten ~ ((List (List 'a)) -> (List 'a)) lists/flatten)
