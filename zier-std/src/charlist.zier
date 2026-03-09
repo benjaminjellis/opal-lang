@@ -1,3 +1,7 @@
 (pub extern type Charlist)
+
+;;; Convert a Charlist to a Sting
 (pub extern let to_string ~ (Charlist -> String) unicode/characters_to_binary)
+
+;;; Convert a String to a Charlist
 (pub extern let from_string ~ (String -> Charlist) unicode/characters_to_list)

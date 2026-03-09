@@ -1,19 +1,39 @@
 (use result [Result])
 
+;;; Type Option represents an optional value: 
+;;; every Option is either Some and contains a value, 
+;;; or None, and does not. Option types are very common in Rust code, as they have a number of uses:
 (pub type ['a] Option ( None (Some ~ 'a) ))
 
+;;; Returns true if the option is a Some value.
 (pub let is_some {option} (match option (Some _) ~> True None ~> False))
 
+;;; Returns true if the option is a Some and the value inside of it matches a predicate.
+(pub let is_some_and {option function}
+  (match option
+    (Some x) ~> (function x)
+    None ~> False))
+
+;;; Returns true if the option is a None value.
 (pub let is_none {option} (match option (Some _) ~> False None ~> True))
 
+;;; Returns true if the option is a None or the value inside of it matches a predicate.
+(pub let is_none_or {option function}
+  (match option
+    (Some x) ~> (function x)
+    None ~> True))
+
+;;; Create an option from a result
 (pub let from_result {result}
   (match result
     (Ok x) ~> (Some x)
     (Error _) ~> None))
 
-(pub let unwrap_or {option or} (match option (Some x) ~> x None ~> or))
-
-(pub let map {option function}
+;;; Returns the contained Some value or a provided default.
+(pub let unwrap_or {option default}
   (match option
-    (Some x) ~> (function x)
-    None ~> None))
+    (Some x) ~> x
+    None ~> default))
+
+;;; If Some x apply a function to x
+(pub let map {option function} (match option (Some x) ~> (function x) None ~> None))

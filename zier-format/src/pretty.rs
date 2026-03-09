@@ -9,17 +9,17 @@ use crate::doc::*;
 
 /// Format a sequence of top-level SExprs to a string.
 ///
-/// `tokens` is the full raw token stream (including `Comment` tokens) from the
-/// lexer. Comments are attached to the form they immediately precede, preserving
-/// blank lines between consecutive comments.
+/// `tokens` is the full raw token stream (including comment/doc-comment tokens)
+/// from the lexer. Comments are attached to the form they immediately precede,
+/// preserving blank lines between consecutive comments.
 ///
 /// Comments *inside* a form (within its span) are dropped — this is a known
 /// limitation of operating at the SExpr level.
 pub fn format_sexprs(sexprs: &[SExpr], tokens: &[Token], source: &str, width: usize) -> String {
-    // Collect only comment tokens for fast lookup.
+    // Collect comment/doc-comment tokens for fast lookup.
     let comments: Vec<&Token> = tokens
         .iter()
-        .filter(|t| t.kind == TokenKind::Comment)
+        .filter(|t| matches!(t.kind, TokenKind::Comment | TokenKind::DocComment))
         .collect();
 
     if sexprs.is_empty() {

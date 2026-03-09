@@ -16,12 +16,13 @@ use tower_lsp::{
         CompletionResponse, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
         DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
         DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-        GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-        InitializeParams, InitializeResult, InitializedParams, Location, MarkedString, MessageType,
-        OneOf, ParameterInformation, ParameterLabel, Position, Range, ReferenceParams,
-        RenameParams, ServerCapabilities, SignatureHelp, SignatureHelpParams, SignatureInformation,
-        SymbolInformation, SymbolKind, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
-        TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
+        Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+        HoverParams, InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
+        MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel,
+        Position, Range, ReferenceParams, RenameParams, ServerCapabilities, SignatureHelp,
+        SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind,
+        TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+        Url, WorkspaceEdit, WorkspaceSymbolParams,
     },
 };
 
@@ -99,6 +100,7 @@ struct TopLevelSymbol {
     kind: SymbolKind,
     selection_range: std::ops::Range<usize>,
     full_range: std::ops::Range<usize>,
+    documentation: Option<String>,
 }
 
 struct SignatureTarget {
@@ -295,21 +297,43 @@ impl LanguageServer for Backend {
         else {
             return Ok(None);
         };
-        if let Some(ty) = best_expr_type_at_offset(&analysis.expr_types, offset) {
-            return Ok(Some(Hover {
-                contents: HoverContents::Scalar(MarkedString::String(ty)),
-                range: None,
-            }));
-        }
         let scheme = if let Some(target) = find_hover_target(&doc.path, &doc.source, offset) {
             match target {
-                HoverTarget::Unqualified(name) => analysis
-                    .bindings
-                    .get(&name)
-                    .cloned()
-                    .or_else(|| analysis.imports.imported_schemes.get(&name).cloned())
-                    .or_else(|| zierc::typecheck::primitive_env().get(&name).cloned())
-                    .map(|scheme| (name, scheme)),
+                HoverTarget::Unqualified(name) => {
+                    if let Some(scheme) = analysis.bindings.get(&name).cloned() {
+                        Some((
+                            name.clone(),
+                            scheme,
+                            Some(Symbol {
+                                module: doc.name.clone(),
+                                function: name,
+                            }),
+                        ))
+                    } else if let Some(scheme) =
+                        analysis.imports.imported_schemes.get(&name).cloned()
+                    {
+                        analysis
+                            .imports
+                            .import_origins
+                            .get(&name)
+                            .cloned()
+                            .map(|module| {
+                                (
+                                    name.clone(),
+                                    scheme,
+                                    Some(Symbol {
+                                        module,
+                                        function: name,
+                                    }),
+                                )
+                            })
+                    } else {
+                        zierc::typecheck::primitive_env()
+                            .get(&name)
+                            .cloned()
+                            .map(|scheme| (name, scheme, None))
+                    }
+                }
                 HoverTarget::Qualified { module, function } => analysis
                     .imports
                     .imported_schemes
@@ -323,7 +347,13 @@ impl LanguageServer for Backend {
                             .and_then(|env| env.get(&function))
                             .cloned()
                     })
-                    .map(|scheme| (format!("{module}/{function}"), scheme)),
+                    .map(|scheme| {
+                        (
+                            format!("{module}/{function}"),
+                            scheme,
+                            Some(Symbol { module, function }),
+                        )
+                    }),
             }
         } else {
             symbol_at(&doc.path, &doc.source, &doc.name, &analysis.imports, offset)
@@ -339,7 +369,7 @@ impl LanguageServer for Backend {
                             .bindings
                             .get(&symbol.function)
                             .cloned()
-                            .map(|scheme| (name, scheme))
+                            .map(|scheme| (name, scheme, Some(symbol)))
                     } else {
                         analysis
                             .imports
@@ -354,17 +384,33 @@ impl LanguageServer for Backend {
                                     .and_then(|env| env.get(&symbol.function))
                                     .cloned()
                             })
-                            .map(|scheme| (name, scheme))
+                            .map(|scheme| (name, scheme, Some(symbol)))
                     }
                 })
         };
 
-        let Some((name, scheme)) = scheme else {
+        let Some((name, scheme, symbol)) = scheme else {
+            if let Some(ty) = best_expr_type_at_offset(&analysis.expr_types, offset) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(ty)),
+                    range: None,
+                }));
+            }
             return Ok(None);
         };
         let rendered = format!("{name} : {}", zierc::typecheck::type_display(&scheme.ty));
+        let docs = symbol
+            .and_then(|symbol| symbol_documentation_for_symbol(&project, &doc, &analysis, &symbol));
+        let contents = if let Some(docs) = docs {
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```zier\n{rendered}\n```\n\n{docs}"),
+            })
+        } else {
+            HoverContents::Scalar(MarkedString::String(rendered))
+        };
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(rendered)),
+            contents,
             range: None,
         }))
     }
@@ -688,10 +734,13 @@ impl LanguageServer for Backend {
                 documentation: None,
             })
             .collect();
+        let documentation =
+            symbol_documentation_for_symbol(&project, &doc, &analysis, &target.symbol)
+                .map(lsp_documentation);
         Ok(Some(SignatureHelp {
             signatures: vec![SignatureInformation {
                 label,
-                documentation: None,
+                documentation,
                 parameters: Some(params),
                 active_parameter: Some(target.arg_index.min(arity.saturating_sub(1)) as u32),
             }],
@@ -852,6 +901,7 @@ impl Project {
 
     fn qualified_completion_items(&self, module: &str, prefix: &str) -> Vec<CompletionItem> {
         let mut items = Vec::new();
+        let docs = self.top_level_docs_for_module(module);
         if let Some(schemes) = self.analysis.all_module_schemes.get(module) {
             for (name, scheme) in schemes {
                 if !name.starts_with(prefix) {
@@ -864,14 +914,23 @@ impl Project {
                         "{module} | {}",
                         zierc::typecheck::type_display(&scheme.ty)
                     )),
+                    docs.get(name).cloned(),
                 ));
             }
         } else if let Some(exports) = self.analysis.module_exports.get(module) {
-            items.extend(completion_items_from_names(
-                exports.clone(),
-                prefix,
-                CompletionItemKind::FUNCTION,
-            ));
+            items.extend(
+                exports
+                    .iter()
+                    .filter(|name| name.starts_with(prefix))
+                    .map(|name| {
+                        completion_item(
+                            name.clone(),
+                            CompletionItemKind::FUNCTION,
+                            None,
+                            docs.get(name.as_str()).cloned(),
+                        )
+                    }),
+            );
         }
         items.sort_by(|a, b| a.label.cmp(&b.label));
         items
@@ -887,6 +946,10 @@ impl Project {
         let local_names = local_names_at_offset(&doc.path, &doc.source, offset)?;
         let mut items = Vec::new();
         let mut seen = HashSet::new();
+        let local_docs = top_level_docs(&doc.path, &doc.source)?
+            .into_iter()
+            .map(|symbol| (symbol.name, symbol.documentation))
+            .collect::<HashMap<_, _>>();
 
         for name in local_names {
             push_completion_item(
@@ -896,6 +959,7 @@ impl Project {
                     name,
                     CompletionItemKind::VARIABLE,
                     Some("local".to_string()),
+                    None,
                 ),
             );
         }
@@ -912,6 +976,7 @@ impl Project {
                     name.clone(),
                     CompletionItemKind::FUNCTION,
                     detail.map(|ty| format!("{} | {ty}", doc.name)),
+                    local_docs.get(name).cloned().flatten(),
                 ),
             );
         }
@@ -936,6 +1001,7 @@ impl Project {
                         "{origin} | {}",
                         zierc::typecheck::type_display(&scheme.ty)
                     )),
+                    self.top_level_docs_for_module(&origin).get(name).cloned(),
                 ),
             );
         }
@@ -949,6 +1015,7 @@ impl Project {
                     label,
                     CompletionItemKind::MODULE,
                     Some("module".to_string()),
+                    None,
                 ),
             );
         }
@@ -964,6 +1031,7 @@ impl Project {
                         "builtin | {}",
                         zierc::typecheck::type_display(&scheme.ty)
                     )),
+                    None,
                 ),
             );
         }
@@ -983,6 +1051,18 @@ impl Project {
             .collect();
         modules.sort();
         modules
+    }
+
+    fn top_level_docs_for_module(&self, module: &str) -> HashMap<String, String> {
+        self.module_named(module)
+            .and_then(|module| top_level_docs(&module.path, &module.source).ok())
+            .map(|symbols| {
+                symbols
+                    .into_iter()
+                    .filter_map(|symbol| symbol.documentation.map(|doc| (symbol.name, doc)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[allow(deprecated)]
@@ -1493,6 +1573,7 @@ fn best_expr_type_at_offset(
         .map(|(_, ty)| ty.clone())
 }
 
+#[cfg(test)]
 fn completion_items_from_names(
     names: Vec<String>,
     prefix: &str,
@@ -1501,7 +1582,7 @@ fn completion_items_from_names(
     let mut items: Vec<_> = names
         .into_iter()
         .filter(|name| name.starts_with(prefix))
-        .map(|name| completion_item(name, kind, None))
+        .map(|name| completion_item(name, kind, None, None))
         .collect();
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items
@@ -1511,13 +1592,22 @@ fn completion_item(
     label: String,
     kind: CompletionItemKind,
     detail: Option<String>,
+    documentation: Option<String>,
 ) -> CompletionItem {
     CompletionItem {
         label,
         kind: Some(kind),
         detail,
+        documentation: documentation.map(lsp_documentation),
         ..CompletionItem::default()
     }
+}
+
+fn lsp_documentation(value: String) -> Documentation {
+    Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    })
 }
 
 fn push_completion_item(
@@ -1799,6 +1889,35 @@ fn scheme_for_symbol(
     }
 }
 
+fn symbol_documentation_for_symbol(
+    project: &Project,
+    doc: &ModuleSource,
+    analysis: &DocumentAnalysis,
+    symbol: &Symbol,
+) -> Option<String> {
+    if symbol.module == doc.name {
+        return top_level_docs(&doc.path, &doc.source)
+            .ok()?
+            .into_iter()
+            .find(|top| top.name == symbol.function)
+            .and_then(|top| top.documentation);
+    }
+
+    let module = analysis
+        .imports
+        .import_origins
+        .get(&symbol.function)
+        .filter(|origin| *origin == &symbol.module)
+        .and_then(|_| project.module_named(&symbol.module))
+        .or_else(|| project.module_named(&symbol.module))?;
+
+    top_level_docs(&module.path, &module.source)
+        .ok()?
+        .into_iter()
+        .find(|top| top.name == symbol.function)
+        .and_then(|top| top.documentation)
+}
+
 fn signature_target_at(
     source_path: &Path,
     source: &str,
@@ -2045,12 +2164,14 @@ fn parse_module(
     Ok((sexprs, decls))
 }
 
-fn top_level_symbols(
+fn top_level_docs(
     source_path: &Path,
     source: &str,
 ) -> std::result::Result<Vec<TopLevelSymbol>, String> {
+    let tokens = zierc::lexer::Lexer::new(source).lex();
     let (_, decls) = parse_module(source_path, source)?;
     let mut out = Vec::new();
+    let mut prev_end = 0;
     for decl in decls {
         match decl {
             zierc::ast::Declaration::Expression(zierc::ast::Expr::LetFunc {
@@ -2058,55 +2179,139 @@ fn top_level_symbols(
                 name_span,
                 span,
                 ..
-            }) => out.push(TopLevelSymbol {
-                name,
-                kind: SymbolKind::FUNCTION,
-                selection_range: name_span,
-                full_range: span,
-            }),
+            }) => {
+                let documentation =
+                    extract_leading_doc_comment(&tokens, source, prev_end, span.start);
+                prev_end = span.end;
+                out.push(TopLevelSymbol {
+                    name,
+                    kind: SymbolKind::FUNCTION,
+                    selection_range: name_span,
+                    full_range: span,
+                    documentation,
+                });
+            }
             zierc::ast::Declaration::ExternLet {
                 name,
                 name_span,
                 span,
                 ..
-            } => out.push(TopLevelSymbol {
-                name,
-                kind: SymbolKind::FUNCTION,
-                selection_range: name_span,
-                full_range: span,
-            }),
+            } => {
+                let documentation =
+                    extract_leading_doc_comment(&tokens, source, prev_end, span.start);
+                prev_end = span.end;
+                out.push(TopLevelSymbol {
+                    name,
+                    kind: SymbolKind::FUNCTION,
+                    selection_range: name_span,
+                    full_range: span,
+                    documentation,
+                });
+            }
             zierc::ast::Declaration::Type(zierc::ast::TypeDecl::Record { name, span, .. }) => {
+                let documentation =
+                    extract_leading_doc_comment(&tokens, source, prev_end, span.start);
+                prev_end = span.end;
                 out.push(TopLevelSymbol {
                     name,
                     kind: SymbolKind::STRUCT,
                     selection_range: span.clone(),
                     full_range: span,
+                    documentation,
                 });
             }
             zierc::ast::Declaration::Type(zierc::ast::TypeDecl::Variant { name, span, .. }) => {
+                let documentation =
+                    extract_leading_doc_comment(&tokens, source, prev_end, span.start);
+                prev_end = span.end;
                 out.push(TopLevelSymbol {
                     name,
                     kind: SymbolKind::ENUM,
                     selection_range: span.clone(),
                     full_range: span,
+                    documentation,
                 });
             }
-            zierc::ast::Declaration::Test { name, span, .. } => out.push(TopLevelSymbol {
-                name,
-                kind: SymbolKind::EVENT,
-                selection_range: span.clone(),
-                full_range: span,
-            }),
-            zierc::ast::Declaration::ExternType { name, span, .. } => out.push(TopLevelSymbol {
-                name,
-                kind: SymbolKind::CLASS,
-                selection_range: span.clone(),
-                full_range: span,
-            }),
-            zierc::ast::Declaration::Use { .. } | zierc::ast::Declaration::Expression(_) => {}
+            zierc::ast::Declaration::Test { name, span, .. } => {
+                let documentation =
+                    extract_leading_doc_comment(&tokens, source, prev_end, span.start);
+                prev_end = span.end;
+                out.push(TopLevelSymbol {
+                    name,
+                    kind: SymbolKind::EVENT,
+                    selection_range: span.clone(),
+                    full_range: span,
+                    documentation,
+                });
+            }
+            zierc::ast::Declaration::ExternType { name, span, .. } => {
+                let documentation =
+                    extract_leading_doc_comment(&tokens, source, prev_end, span.start);
+                prev_end = span.end;
+                out.push(TopLevelSymbol {
+                    name,
+                    kind: SymbolKind::CLASS,
+                    selection_range: span.clone(),
+                    full_range: span,
+                    documentation,
+                });
+            }
+            zierc::ast::Declaration::Use { span, .. } => {
+                prev_end = span.end;
+            }
+            zierc::ast::Declaration::Expression(_) => {}
         }
     }
     Ok(out)
+}
+
+fn top_level_symbols(
+    source_path: &Path,
+    source: &str,
+) -> std::result::Result<Vec<TopLevelSymbol>, String> {
+    top_level_docs(source_path, source)
+}
+
+fn extract_leading_doc_comment(
+    tokens: &[zierc::lexer::Token],
+    source: &str,
+    region_start: usize,
+    region_end: usize,
+) -> Option<String> {
+    let mut current_block: Vec<&zierc::lexer::Token> = Vec::new();
+    let mut last_block: Vec<&zierc::lexer::Token> = Vec::new();
+
+    for token in tokens
+        .iter()
+        .filter(|token| token.span.start >= region_start && token.span.end <= region_end)
+    {
+        match token.kind {
+            zierc::lexer::TokenKind::DocComment => current_block.push(token),
+            zierc::lexer::TokenKind::Comment => {
+                current_block.clear();
+                last_block.clear();
+            }
+            _ => {}
+        }
+        if !current_block.is_empty() {
+            last_block = current_block.clone();
+        }
+    }
+
+    if last_block.is_empty() {
+        return None;
+    }
+
+    let lines: Vec<String> = last_block
+        .into_iter()
+        .map(|token| {
+            source[token.span.clone()]
+                .trim_start_matches(";;;")
+                .trim_start()
+                .to_string()
+        })
+        .collect();
+    Some(lines.join("\n"))
 }
 
 fn top_level_bindings(decls: &[zierc::ast::Declaration]) -> HashSet<String> {
@@ -2741,6 +2946,17 @@ mod tests {
     }
 
     #[test]
+    fn hover_target_finds_top_level_function_reference_inside_call() {
+        let src = "(let add_one {x} (+ x 1))\n(let main {} (add_one 2))";
+        let offset = src.rfind("add_one").unwrap();
+        let target = find_hover_target(Path::new("src/main.zier"), src, offset);
+        match target {
+            Some(HoverTarget::Unqualified(name)) => assert_eq!(name, "add_one"),
+            other => panic!("unexpected target: {other:?}"),
+        }
+    }
+
+    #[test]
     fn hover_target_ignores_local_bindings() {
         let src = "(let main {} (let [assert_eq 1] assert_eq))";
         let offset = src.rfind("assert_eq").unwrap();
@@ -2909,6 +3125,7 @@ mod tests {
             "io/".to_string(),
             CompletionItemKind::MODULE,
             Some("module".to_string()),
+            None,
         );
         assert_eq!(item.label, "io/");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
@@ -2930,6 +3147,23 @@ mod tests {
                 "main".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn top_level_symbols_attach_doc_comments() {
+        let src = ";;; adds one\n;;; to its input\n(let add_one {x} (+ x 1))\n";
+        let symbols = top_level_symbols(Path::new("src/main.zier"), src).unwrap();
+        assert_eq!(
+            symbols[0].documentation.as_deref(),
+            Some("adds one\nto its input")
+        );
+    }
+
+    #[test]
+    fn plain_comments_do_not_attach_as_docs() {
+        let src = ";;; docs\n;; note\n(let add_one {x} (+ x 1))\n";
+        let symbols = top_level_symbols(Path::new("src/main.zier"), src).unwrap();
+        assert_eq!(symbols[0].documentation, None);
     }
 
     #[test]

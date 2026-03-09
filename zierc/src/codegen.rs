@@ -470,6 +470,28 @@ fn lower_variable(name: &str, ctx: &Ctx, renames: &HashMap<String, String>) -> i
     if let Some(mapped) = renames.get(name) {
         return ir::Expr::Var(mapped.clone());
     }
+    if let Some(erl_op) = unary_op(name) {
+        return ir::Expr::Fun(
+            "A__".to_string(),
+            Box::new(ir::Expr::UnOp(
+                erl_op.to_string(),
+                Box::new(ir::Expr::Var("A__".to_string())),
+            )),
+        );
+    }
+    if let Some(erl_op) = binary_op(name) {
+        return ir::Expr::Fun(
+            "A__".to_string(),
+            Box::new(ir::Expr::Fun(
+                "B__".to_string(),
+                Box::new(ir::Expr::BinOp(
+                    erl_op.to_string(),
+                    Box::new(ir::Expr::Var("A__".to_string())),
+                    Box::new(ir::Expr::Var("B__".to_string())),
+                )),
+            )),
+        );
+    }
     // Nullary constructor → atom
     if let Some(&0) = ctx.constructors.get(name) {
         return ir::Expr::Atom(name.to_lowercase());
@@ -901,6 +923,18 @@ mod tests {
         assert!(
             erl.contains("add(1, X)") || erl.contains("add(1,X)"),
             "expected add(1, X):\n{erl}"
+        );
+    }
+
+    #[test]
+    fn builtin_boolean_operator_can_appear_in_value_position() {
+        let src = r#"
+(let choose_or {} or)
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("fun(A__) -> fun(B__) -> (A__ orelse B__) end end"),
+            "expected first-class builtin operator lowering:\n{erl}"
         );
     }
 }

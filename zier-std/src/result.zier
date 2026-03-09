@@ -1,4 +1,8 @@
+;;; Result is the type used for returning and propagating
+;;; errors. It is an enum with the variants, Ok 'a, representing
+;;; success and containing a value, and Err 'e, representing error
+;;; and containing an error value.
 (pub type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
 
-;; bnd for let?
+;;; bnd for let?
 (pub let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
