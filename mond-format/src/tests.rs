@@ -393,7 +393,7 @@ fn do_in_match_arm() {
 
 #[test]
 fn extern_type_sig_idempotent() {
-    let src = include_str!("../../mond-std/src/map.mond");
+    let src = "(pub extern type ['k 'v] Map maps/map)\n(pub extern let new ~ (Unit -> (Map 'k 'v)) maps/new)";
     let out = format(src, 100);
     assert!(!out.contains("'k\n"), "type sig is breaking badly:\n{out}");
     let out2 = format(&out, 100);

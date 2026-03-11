@@ -34,6 +34,13 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     let version = manifest.package.version.to_string();
 
     // Generate the escript entry-point shim: <app_name>:main/1 calls our main:main(unit)
+    let shim_path = src_dir.join(format!("{app_name}.erl"));
+    if shim_path.exists() {
+        return Err(eyre::eyre!(
+            "Erlang module name collision: release shim `{app_name}` would overwrite {}",
+            shim_path.display()
+        ));
+    }
     let shim = format!(
         "-module({app_name}).\n\
          -export([main/1]).\n\
@@ -41,8 +48,7 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
          main(_Args) ->\n\
              main:main(unit).\n"
     );
-    std::fs::write(src_dir.join(format!("{app_name}.erl")), shim)
-        .context("could not write escript shim")?;
+    std::fs::write(&shim_path, shim).context("could not write escript shim")?;
 
     // Generate <app_name>.app.src
     let app_src = format!(

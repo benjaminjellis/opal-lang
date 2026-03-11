@@ -1,6 +1,62 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{ast, codegen, lower, resolve, session, sexpr, typecheck, warnings};
+
+const PRIMITIVE_TYPE_NAMES: [&str; 6] = ["Int", "Float", "Bool", "String", "Unit", "List"];
+
+fn collect_type_sig_names(sig: &ast::TypeSig, out: &mut HashSet<String>) {
+    match sig {
+        ast::TypeSig::Named(name) => {
+            out.insert(name.clone());
+        }
+        ast::TypeSig::Generic(_) => {}
+        ast::TypeSig::App(head, args) => {
+            out.insert(head.clone());
+            for arg in args {
+                collect_type_sig_names(arg, out);
+            }
+        }
+        ast::TypeSig::Fun(a, b) => {
+            collect_type_sig_names(a, out);
+            collect_type_sig_names(b, out);
+        }
+    }
+}
+
+fn known_type_names(
+    decls: &[ast::Declaration],
+    imported_type_decls: &[ast::TypeDecl],
+) -> HashSet<String> {
+    let mut known: HashSet<String> = PRIMITIVE_TYPE_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for type_decl in imported_type_decls {
+        match type_decl {
+            ast::TypeDecl::Record { name, .. } => {
+                known.insert(name.clone());
+            }
+            ast::TypeDecl::Variant { name, .. } => {
+                known.insert(name.clone());
+            }
+        }
+    }
+    for decl in decls {
+        match decl {
+            ast::Declaration::Type(ast::TypeDecl::Record { name, .. }) => {
+                known.insert(name.clone());
+            }
+            ast::Declaration::Type(ast::TypeDecl::Variant { name, .. }) => {
+                known.insert(name.clone());
+            }
+            ast::Declaration::ExternType { name, .. } => {
+                known.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+    known
+}
 
 /// Compile without any imports (single-file or when imports are already resolved).
 #[cfg(test)]
@@ -111,6 +167,46 @@ pub fn compile_with_imports_in_session(
         sess.emit(&lowerer.files, diag);
     }
     if !duplicate_type_constructors.is_empty() {
+        return session::CompileReport {
+            output: None,
+            files: lowerer.files,
+            diagnostics,
+        };
+    }
+
+    let known_types = known_type_names(&decls, imported_type_decls);
+    let mut extern_type_errors = false;
+    for decl in &decls {
+        let ast::Declaration::ExternLet { name, ty, span, .. } = decl else {
+            continue;
+        };
+        let mut referenced_types = HashSet::new();
+        collect_type_sig_names(ty, &mut referenced_types);
+        let mut unknown: Vec<String> = referenced_types
+            .into_iter()
+            .filter(|type_name| !known_types.contains(type_name))
+            .collect();
+        unknown.sort();
+        if unknown.is_empty() {
+            continue;
+        }
+
+        let plural = if unknown.len() == 1 { "" } else { "s" };
+        let diag = codespan_reporting::diagnostic::Diagnostic::error()
+            .with_message(format!(
+                "unknown type{plural} in extern signature for `{name}`: {}",
+                unknown.join(", ")
+            ))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span.clone()).with_message(
+                    "import these types (for example: `(use option [Option])`) or declare them in this module",
+                ),
+            ]);
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, &diag);
+        extern_type_errors = true;
+    }
+    if extern_type_errors {
         return session::CompileReport {
             output: None,
             files: lowerer.files,

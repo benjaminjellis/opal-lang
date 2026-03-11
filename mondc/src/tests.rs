@@ -6,6 +6,23 @@ use crate::{
     session, typecheck, warnings,
 };
 
+const RESULT_STD_SRC: &str = r#"
+(pub type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(pub let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
+"#;
+
+const IO_STD_SRC: &str = r#"
+(pub extern let println ~ (String -> Unit) io/format)
+(pub extern let debug ~ ('a -> Unit) io/format)
+"#;
+
+const TESTING_STD_SRC: &str = r#"
+(use result [Result])
+(pub let assert {cond} (if cond (Ok ()) (Error "assertion failed")))
+(pub extern let assert_eq ~ ('a -> 'a -> (Result Unit String)) mond_testing_helpers/assert_eq)
+(pub extern let assert_ne ~ ('a -> 'a -> (Result Unit String)) mond_testing_helpers/assert_ne)
+"#;
+
 #[test]
 fn qualified_std_call_requires_use() {
     let mut module_exports = HashMap::new();
@@ -186,6 +203,162 @@ fn duplicate_module_use_without_unqualified_imports_is_allowed() {
 }
 
 #[test]
+fn qualified_only_use_does_not_import_variant_constructors_unqualified() {
+    let result_src =
+        "(pub type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))\n(pub let bind {m f} (f m))";
+    let std_mods = vec![(
+        "result".to_string(),
+        "mond_result".to_string(),
+        result_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use result)\n(let main {} (Ok 1))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        report.has_errors(),
+        "qualified-only use should not import constructors"
+    );
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages.iter().any(|m| m.contains("unbound variable `Ok`")),
+        "expected Ok to be unbound, diagnostics: {messages:?}"
+    );
+}
+
+#[test]
+fn importing_type_name_brings_variant_constructors_into_scope() {
+    let result_src =
+        "(pub type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))\n(pub let bind {m f} (f m))";
+    let std_mods = vec![(
+        "result".to_string(),
+        "mond_result".to_string(),
+        result_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use result [Result])\n(let main {} (Ok 1))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        !report.has_errors(),
+        "type import should make constructors available: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_only_use_keeps_record_field_accessors_available() {
+    let map_src = "(pub type ['a 'b] TakeResult ((:value ~ 'a) (:rest ~ 'b)))\n(pub let take {} (TakeResult :value \"mond\" :rest \"std\"))";
+    let std_mods = vec![(
+        "map".to_string(),
+        "mond_map".to_string(),
+        map_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use map)\n(let main {} (:value (map/take)))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        !report.has_errors(),
+        "record field access should work without unqualified type import: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn extern_signature_reports_unknown_type_without_type_import() {
+    let src = "(pub extern let nth ~ (Int -> (List 'a) -> Option 'a) mond_list_helpers/nth)\n(let main {} ())";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &HashMap::new(),
+    );
+    assert!(report.has_errors());
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unknown type") && m.contains("Option")),
+        "expected unknown extern type diagnostic, got: {messages:?}"
+    );
+}
+
+#[test]
+fn extern_signature_accepts_type_imported_unqualified() {
+    let src = "(use option [Option])\n(pub extern let nth ~ (Int -> (List 'a) -> Option 'a) mond_list_helpers/nth)\n(let main {} ())";
+    let mut module_exports = HashMap::new();
+    module_exports.insert("option".to_string(), vec![]);
+    let imported_type_decls = exported_type_decls("(pub type ['a] Option ((Some ~ 'a) None))");
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &module_exports,
+        HashMap::new(),
+        &imported_type_decls,
+        &HashMap::new(),
+    );
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn wildcard_import_enables_unqualified_call() {
     let mut module_exports = HashMap::new();
     module_exports.insert("math".to_string(), vec!["inc".to_string()]);
@@ -236,7 +409,7 @@ fn pub_reexports_only_include_pub_use_decls() {
 
 #[test]
 fn infer_module_exports_preserves_result_bind_error_type() {
-    let src = include_str!("../../mond-std/src/result.mond");
+    let src = RESULT_STD_SRC;
     let mut module_exports = HashMap::new();
     module_exports.insert(
         "result".to_string(),
@@ -312,8 +485,8 @@ fn infer_module_exports_preserves_result_bind_error_type() {
 
 #[test]
 fn imported_result_bind_reports_continuation_mismatch() {
-    let result_src = include_str!("../../mond-std/src/result.mond");
-    let io_src = include_str!("../../mond-std/src/io.mond");
+    let result_src = RESULT_STD_SRC;
+    let io_src = IO_STD_SRC;
 
     let mut module_exports = HashMap::new();
     module_exports.insert(
@@ -389,9 +562,9 @@ fn imported_result_bind_reports_continuation_mismatch() {
 
 #[test]
 fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
-    let result_src = include_str!("../../mond-std/src/result.mond");
-    let io_src = include_str!("../../mond-std/src/io.mond");
-    let testing_src = include_str!("../../mond-std/src/testing.mond");
+    let result_src = RESULT_STD_SRC;
+    let io_src = IO_STD_SRC;
+    let testing_src = TESTING_STD_SRC;
 
     let mut module_exports = HashMap::new();
     module_exports.insert(

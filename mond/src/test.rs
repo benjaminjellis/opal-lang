@@ -11,9 +11,17 @@ use crate::{
 
 const TEST_DIR: &str = "tests";
 
+fn prepare_test_build_dir(build_dir: &Path) -> eyre::Result<()> {
+    if build_dir.exists() {
+        std::fs::remove_dir_all(build_dir).context("could not clean test build dir")?;
+    }
+    std::fs::create_dir_all(build_dir).context("could not create build dir")?;
+    Ok(())
+}
+
 pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let build_dir = project_dir.join(TARGET_DIR).join(TEST_BUILD_DIR);
-    std::fs::create_dir_all(&build_dir).context("could not create build dir")?;
+    prepare_test_build_dir(&build_dir)?;
 
     // Compile src/ modules and get compilation state
     let ErlSources {
@@ -41,6 +49,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     // Scan test files to collect their exports and sources
     let mut test_module_sources: Vec<(String, String)> = Vec::new();
     let mut test_module_exports: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen_test_modules: HashMap<String, std::path::PathBuf> = HashMap::new();
 
     for test_path in &test_files {
         let module_name = test_path
@@ -48,6 +57,13 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
+        if let Some(first_path) = seen_test_modules.insert(module_name.clone(), test_path.clone()) {
+            return Err(eyre::eyre!(
+                "test module name collision: `{module_name}` appears in both {} and {}",
+                first_path.display(),
+                test_path.display()
+            ));
+        }
 
         let source = std::fs::read_to_string(test_path)
             .with_context(|| format!("could not read {}", test_path.display()))?;
@@ -102,6 +118,12 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         match report.output {
             Some(erl_src) if !report.has_errors() => {
                 let erl_path = build_dir.join(format!("{module_name}.erl"));
+                if erl_path.exists() {
+                    return Err(eyre::eyre!(
+                        "Erlang module name collision: tests/{module_name}.mond would overwrite {}",
+                        erl_path.display()
+                    ));
+                }
                 std::fs::write(&erl_path, erl_src)
                     .with_context(|| format!("could not write {}", erl_path.display()))?;
                 erl_paths.push(erl_path);
@@ -142,7 +164,13 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         }
         let erl_path = build_dir.join(format!("{erlang_name}.erl"));
         if erl_path.exists() {
-            continue; // already compiled by generate_erl_sources
+            if erl_paths.iter().any(|p| p == &erl_path) {
+                continue; // already compiled by generate_erl_sources
+            }
+            return Err(eyre::eyre!(
+                "Erlang module name collision: std module `{user_name}` would overwrite {}",
+                erl_path.display()
+            ));
         }
 
         let resolved =
@@ -181,20 +209,6 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         ));
     }
 
-    // Copy any hand-written .erl std helpers needed by test files into the build dir
-    let std_dir = crate::build::std_dir();
-    for file in std_dir.files() {
-        if file.path().extension().and_then(|e| e.to_str()) == Some("erl") {
-            let file_name = file.path().file_name().unwrap();
-            let dest = build_dir.join(file_name);
-            if !dest.exists() {
-                std::fs::write(&dest, file.contents())
-                    .with_context(|| format!("could not write {}", dest.display()))?;
-                erl_paths.push(dest);
-            }
-        }
-    }
-
     let total: usize = test_fns_by_module.iter().map(|(_, fns)| fns.len()).sum();
     if total == 0 {
         ui::warn("no test declarations found");
@@ -204,6 +218,12 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     // Generate the test runner Erlang module
     let runner_erl = generate_runner(&test_fns_by_module);
     let runner_path = build_dir.join("mond_test_runner.erl");
+    if runner_path.exists() {
+        return Err(eyre::eyre!(
+            "Erlang module name collision: generated test runner would overwrite {}",
+            runner_path.display()
+        ));
+    }
     std::fs::write(&runner_path, &runner_erl).context("could not write test runner")?;
     erl_paths.push(runner_path);
 
@@ -295,4 +315,46 @@ run() ->
     end.
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_test_build_dir;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mond-test-build-clean-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn prepare_test_build_dir_removes_stale_artifacts() {
+        let root = unique_temp_root();
+        let build_dir = root.join("target/tests");
+        std::fs::create_dir_all(&build_dir).expect("create build dir");
+        std::fs::write(build_dir.join("stale.erl"), "stale").expect("write stale artifact");
+
+        prepare_test_build_dir(&build_dir).expect("prepare build dir");
+
+        assert!(
+            build_dir.exists(),
+            "build dir should exist after preparing: {}",
+            build_dir.display()
+        );
+        assert!(
+            !build_dir.join("stale.erl").exists(),
+            "stale artifacts should be removed"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
 }

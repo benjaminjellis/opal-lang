@@ -6,7 +6,6 @@ use std::{
 };
 
 use codespan_reporting::diagnostic::{Diagnostic as CodeDiagnostic, LabelStyle, Severity};
-use include_dir::{Dir, include_dir};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_lsp::{
     Client, LanguageServer, LspService, Server,
@@ -25,8 +24,6 @@ use tower_lsp::{
         Url, WorkspaceEdit, WorkspaceSymbolParams,
     },
 };
-
-static STD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../mond-std/src");
 
 #[derive(Clone, Debug)]
 struct DocumentState {
@@ -758,10 +755,11 @@ impl Project {
         focus_uri: &Url,
     ) -> std::result::Result<Self, String> {
         let overlays = state.lock().unwrap().open_docs.clone();
-        let std_modules = collect_std_modules();
+        let std_modules = collect_std_modules(root);
         let src_modules = collect_modules(root, "src", &overlays);
         let test_modules = collect_modules(root, "tests", &overlays);
-        let analysis = build_project_analysis(&src_modules)?;
+        let package_name = package_name_from_manifest(root);
+        let analysis = build_project_analysis(&std_modules, &src_modules, package_name.as_deref())?;
 
         // Ensure an open unsaved file outside src/tests still gets analyzed standalone.
         if let Ok(path) = focus_uri.to_file_path()
@@ -1134,14 +1132,24 @@ impl Project {
 }
 
 fn build_project_analysis(
+    std_modules: &BTreeMap<String, ModuleSource>,
     src_modules: &BTreeMap<String, ModuleSource>,
+    package_name: Option<&str>,
 ) -> std::result::Result<mondc::ProjectAnalysis, String> {
-    let std_mods = std_modules();
+    let std_mods = std_modules
+        .iter()
+        .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
+        .collect::<Vec<(String, String)>>();
+    let std_mods = mondc::std_modules_from_sources(&std_mods)?;
     let src_module_sources: Vec<(String, String)> = src_modules
         .iter()
         .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect();
-    mondc::build_project_analysis(&std_mods, &src_module_sources)
+    let mut analysis = mondc::build_project_analysis(&std_mods, &src_module_sources)?;
+    if let Some(package_name) = package_name {
+        mondc::alias_package_root_module(&mut analysis, package_name)?;
+    }
+    Ok(analysis)
 }
 
 fn visible_exports(
@@ -1214,48 +1222,53 @@ fn collect_mond_files_from_dir(dir: &Path, modules: &mut BTreeMap<String, Module
     }
 }
 
-fn std_modules() -> Vec<(String, String, String)> {
-    let mut std_sources: BTreeMap<String, String> = STD_DIR
-        .files()
-        .filter_map(|file| {
-            let path = file.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("mond") {
-                return None;
-            }
-            let module_name = path.file_stem()?.to_str()?;
-            if module_name == "lib" {
-                return None;
-            }
-            Some((module_name.to_string(), file.contents_utf8()?.to_string()))
-        })
-        .collect();
-
-    if let Some(lib_src) = STD_DIR.get_file("lib.mond").and_then(|f| f.contents_utf8()) {
-        std_sources.insert("std".to_string(), lib_src.to_string());
+fn std_source_root(root: Option<&Path>) -> Option<PathBuf> {
+    if let Some(root) = root {
+        let dep_root = root.join("target").join("deps").join("std").join("src");
+        if dep_root.exists() {
+            return Some(dep_root);
+        }
     }
 
-    mondc::std_modules_from_sources(&std_sources.into_iter().collect::<Vec<(String, String)>>())
-        .expect("embedded std modules should form a valid dependency graph")
+    let workspace_std = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../mond-std/src");
+    if workspace_std.exists() {
+        return Some(workspace_std);
+    }
+
+    None
 }
 
-fn collect_std_modules() -> BTreeMap<String, ModuleSource> {
-    let std_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../mond-std/src");
-    std_modules()
-        .into_iter()
-        .map(|(name, _, source)| {
-            let path = if name == "std" {
-                std_root.join("lib.mond")
-            } else {
-                std_root.join(format!("{name}.mond"))
-            };
-            let module = ModuleSource {
-                name: name.clone(),
-                path,
-                source,
-            };
-            (name, module)
-        })
-        .collect()
+fn package_name_from_manifest(root: Option<&Path>) -> Option<String> {
+    let root = root?;
+    let manifest_path = root.join("mond.toml");
+    let manifest_source = fs::read_to_string(manifest_path).ok()?;
+    let manifest: toml::Value = toml::from_str(&manifest_source).ok()?;
+    manifest
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+}
+
+fn collect_std_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
+    let Some(std_root) = std_source_root(root) else {
+        return BTreeMap::new();
+    };
+
+    let mut discovered = BTreeMap::new();
+    collect_mond_files_from_dir(&std_root, &mut discovered);
+
+    let mut modules = BTreeMap::new();
+    for (_, mut module) in discovered {
+        let name = if module.name == "lib" {
+            "std".to_string()
+        } else {
+            module.name.clone()
+        };
+        module.name = name.clone();
+        modules.insert(name, module);
+    }
+    modules
 }
 
 fn find_top_level_definition_range(
@@ -2998,14 +3011,55 @@ mod tests {
 
     #[test]
     fn std_modules_include_submodules_without_root_reexports() {
-        let std_mods = std_modules();
+        let std_modules = BTreeMap::from([
+            (
+                "std".to_string(),
+                ModuleSource {
+                    name: "std".to_string(),
+                    path: PathBuf::from("std/lib.mond"),
+                    source: "(pub let hello {} 1)".to_string(),
+                },
+            ),
+            (
+                "io".to_string(),
+                ModuleSource {
+                    name: "io".to_string(),
+                    path: PathBuf::from("std/io.mond"),
+                    source: "(pub let println {x} x)".to_string(),
+                },
+            ),
+        ]);
+        let std_mods = std_modules
+            .iter()
+            .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
+            .collect::<Vec<(String, String)>>();
+        let std_mods = mondc::std_modules_from_sources(&std_mods).expect("std modules");
         assert!(std_mods.iter().any(|(name, _, _)| name == "std"));
         assert!(std_mods.iter().any(|(name, _, _)| name == "io"));
     }
 
     #[test]
     fn resolve_imports_supports_std_submodules_without_root_reexports() {
-        let analysis = build_project_analysis(&BTreeMap::new()).expect("project analysis");
+        let std_modules = BTreeMap::from([
+            (
+                "std".to_string(),
+                ModuleSource {
+                    name: "std".to_string(),
+                    path: PathBuf::from("std/lib.mond"),
+                    source: "(pub let hello {} 1)".to_string(),
+                },
+            ),
+            (
+                "io".to_string(),
+                ModuleSource {
+                    name: "io".to_string(),
+                    path: PathBuf::from("std/io.mond"),
+                    source: "(pub let println {x} x)".to_string(),
+                },
+            ),
+        ]);
+        let analysis =
+            build_project_analysis(&std_modules, &BTreeMap::new(), None).expect("project analysis");
         let imports = mondc::resolve_imports_for_source(
             "(use std/io)\n(let main {} ())",
             &analysis.module_exports,
@@ -3013,6 +3067,31 @@ mod tests {
         );
         assert!(analysis.module_exports.contains_key("io"));
         assert!(imports.module_aliases.contains_key("io"));
+    }
+
+    #[test]
+    fn package_name_aliases_lib_module_for_import_resolution() {
+        let src_modules = BTreeMap::from([(
+            "lib".to_string(),
+            ModuleSource {
+                name: "lib".to_string(),
+                path: PathBuf::from("src/lib.mond"),
+                source: "(pub let now {} 1)".to_string(),
+            },
+        )]);
+        let analysis = build_project_analysis(&BTreeMap::new(), &src_modules, Some("time"))
+            .expect("project analysis");
+        let imports = mondc::resolve_imports_for_source(
+            "(use time)\n(let main {} (time/now))",
+            &analysis.module_exports,
+            &analysis,
+        );
+
+        assert!(analysis.module_exports.contains_key("time"));
+        assert_eq!(
+            imports.module_aliases.get("time").map(String::as_str),
+            Some("lib")
+        );
     }
 
     #[test]

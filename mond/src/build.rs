@@ -1,51 +1,138 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use crate::{BIN_ENTRY_POINT, LIB_ROOT, TARGET_DIR, gitignore};
 use eyre::Context;
+use walkdir::WalkDir;
 
-use crate::{DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, manifest, ui, utils::find_mond_files};
+use crate::{DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, deps, manifest, ui, utils::find_mond_files};
 
-// mond-std is embedded at compile time — std ships with mond,
-use include_dir::{Dir, include_dir};
-static STD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../mond-std/src");
+const ERLANG_RESERVED_MODULE_NAMES: &[&str] = &[
+    "application",
+    "code",
+    "erlang",
+    "ets",
+    "file",
+    "filename",
+    "gen_server",
+    "gen_statem",
+    "init",
+    "io",
+    "lists",
+    "maps",
+    "math",
+    "proc_lib",
+    "rand",
+    "re",
+    "string",
+    "timer",
+    "unicode",
+];
 
-pub(crate) fn std_dir() -> &'static Dir<'static> {
-    &STD_DIR
+fn reserved_local_erlang_alias(module_name: &str) -> Option<String> {
+    ERLANG_RESERVED_MODULE_NAMES
+        .contains(&module_name)
+        .then(|| format!("mond_user_{module_name}"))
 }
 
-/// Return `(user_name, erlang_name, source)` for each std module:
-///   - user_name:   the name users write in `(use std/io)` → "io"
-///   - erlang_name: the compiled Erlang module name → "mond_io"
-///     Prefixed with "mond_" to avoid shadowing Erlang/OTP built-in modules.
-pub(crate) fn std_modules() -> Vec<(String, String, String)> {
-    let mut std_sources: Vec<(String, String)> = STD_DIR
-        .files()
-        .filter_map(|file| {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("mond") {
-                return None;
-            }
-            let module_name = path.file_stem()?.to_str()?;
-            if module_name == "lib" {
-                return None;
-            }
-            Some((module_name.to_string(), file.contents_utf8()?.to_string()))
-        })
-        .collect();
+fn apply_reserved_local_module_aliases(
+    analysis: &mut mondc::ProjectAnalysis,
+    module_sources: &[(String, String)],
+) {
+    for (module_name, _) in module_sources {
+        if let Some(alias) = reserved_local_erlang_alias(module_name) {
+            analysis.std_aliases.insert(module_name.clone(), alias);
+        }
+    }
+}
 
-    if let Some(lib_src) = STD_DIR
-        .get_file("lib.mond")
-        .and_then(|file| file.contents_utf8())
-    {
-        std_sources.push(("std".to_string(), lib_src.to_string()));
+fn register_erl_output_name(
+    seen: &mut HashMap<String, String>,
+    erl_module_name: &str,
+    origin: String,
+) -> eyre::Result<()> {
+    if let Some(existing_origin) = seen.get(erl_module_name) {
+        if existing_origin != &origin {
+            return Err(eyre::eyre!(
+                "Erlang module name collision: `{erl_module_name}` is produced by `{existing_origin}` and `{origin}`"
+            ));
+        }
+        return Ok(());
+    }
+    seen.insert(erl_module_name.to_string(), origin);
+    Ok(())
+}
+
+fn ensure_no_erl_output_collisions(
+    ordered_module_sources: &[(String, String)],
+    module_aliases: &HashMap<String, String>,
+    std_mods: &[(String, String, String)],
+    used_std_names: &HashSet<String>,
+    std_helper_erls: &[deps::HelperErlFile],
+    local_helper_erls: &[deps::HelperErlFile],
+) -> eyre::Result<()> {
+    let mut seen: HashMap<String, String> = HashMap::new();
+
+    for (module_name, _) in ordered_module_sources {
+        let erlang_name = module_aliases
+            .get(module_name.as_str())
+            .map(String::as_str)
+            .unwrap_or(module_name);
+        register_erl_output_name(&mut seen, erlang_name, format!("src/{module_name}.mond"))?;
     }
 
-    mondc::std_modules_from_sources(&std_sources)
-        .expect("embedded std modules should form a valid dependency graph")
+    for (user_name, erlang_name, _) in std_mods {
+        if !used_std_names.contains(user_name) {
+            continue;
+        }
+        register_erl_output_name(
+            &mut seen,
+            erlang_name,
+            format!("std dependency module `{user_name}`"),
+        )?;
+    }
+
+    for helper in std_helper_erls {
+        register_erl_output_name(
+            &mut seen,
+            &helper.module_name,
+            format!("std dependency helper `{}`", helper.file_name),
+        )?;
+    }
+
+    for helper in local_helper_erls {
+        register_erl_output_name(
+            &mut seen,
+            &helper.module_name,
+            format!("local helper `{}`", helper.file_name),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn collect_local_helper_erls(src_dir: &Path) -> eyre::Result<Vec<deps::HelperErlFile>> {
+    let mut helper_erls: Vec<deps::HelperErlFile> = WalkDir::new(src_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("erl"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?.to_string();
+            let module_name = path.file_stem()?.to_str()?.to_string();
+            let contents = std::fs::read(path).ok()?;
+            Some(deps::HelperErlFile {
+                file_name,
+                module_name,
+                contents,
+            })
+        })
+        .collect();
+    helper_erls.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    Ok(helper_erls)
 }
 
 pub(crate) struct ErlSources {
@@ -64,8 +151,11 @@ pub(crate) struct ErlSources {
 /// Returns the generated file paths, the project manifest, and detected project type.
 pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::Result<ErlSources> {
     let manifest = manifest::read_manifest(project_dir.into())?;
+    let std_dep = deps::load_std_dependency(project_dir, &manifest)?;
+    let std_mods = std_dep.modules.clone();
 
     let src_dir = project_dir.join(SOURCE_DIR);
+    let local_helper_erls = collect_local_helper_erls(&src_dir)?;
     let mond_files = find_mond_files(&src_dir);
 
     if mond_files.is_empty() {
@@ -102,24 +192,45 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
     let ordered_module_sources =
         mondc::ordered_module_sources(&module_sources).map_err(|err| eyre::eyre!(err))?;
 
-    // Phase 1b: seed module_exports with embedded std modules so the compiler's
-    // `use` validation and import building treats them identically to local modules.
-    let std_mods = std_modules();
-    let analysis = mondc::build_project_analysis(&std_mods, &module_sources)
+    // Phase 1b: seed module_exports with std modules provided in manifest deps.
+    let mut analysis = mondc::build_project_analysis(&std_mods, &module_sources)
         .map_err(|err| eyre::eyre!(err))?;
+    mondc::alias_package_root_module(&mut analysis, &manifest.package.name)
+        .map_err(|err| eyre::eyre!(err))?;
+    apply_reserved_local_module_aliases(&mut analysis, &module_sources);
     module_exports = analysis.module_exports.clone();
     module_type_decls = analysis.module_type_decls.clone();
     let all_module_schemes = analysis.all_module_schemes.clone();
     let std_aliases = analysis.std_aliases.clone();
+
+    // Compile only std modules that are actually used.
+    let used_std_names: HashSet<String> = ordered_module_sources
+        .iter()
+        .flat_map(|(_, src)| mondc::used_modules(src))
+        .map(|(_, m, _)| m)
+        .collect();
+    ensure_no_erl_output_collisions(
+        &ordered_module_sources,
+        &std_aliases,
+        &std_mods,
+        &used_std_names,
+        &std_dep.helper_erls,
+        &local_helper_erls,
+    )?;
 
     // Phase 2: compile each user file with its resolved import map
     let mut erl_paths: Vec<PathBuf> = Vec::new();
     let mut had_error = false;
     for (module_name, source) in &ordered_module_sources {
         let resolved = mondc::resolve_imports_for_source(source, &module_exports, &analysis);
+        let erlang_module_name = resolved
+            .module_aliases
+            .get(module_name.as_str())
+            .cloned()
+            .unwrap_or_else(|| module_name.clone());
 
         let report = mondc::compile_with_imports_report(
-            module_name,
+            &erlang_module_name,
             source,
             &format!("{module_name}.mond"),
             resolved.imports,
@@ -135,7 +246,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         );
         match report.output {
             Some(erl_src) if !report.has_errors() => {
-                let erl_path = erl_dir.join(format!("{module_name}.erl"));
+                let erl_path = erl_dir.join(format!("{erlang_module_name}.erl"));
                 std::fs::write(&erl_path, erl_src)
                     .with_context(|| format!("could not write {}", erl_path.display()))?;
                 erl_paths.push(erl_path);
@@ -151,13 +262,6 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
     }
 
     validate_bin_entrypoint(&project_type, &module_sources)?;
-
-    // Compile only std modules that are actually used
-    let used_std_names: std::collections::HashSet<String> = ordered_module_sources
-        .iter()
-        .flat_map(|(_, src)| mondc::used_modules(src))
-        .map(|(_, m, _)| m)
-        .collect();
 
     let std_analysis =
         mondc::build_project_analysis(&std_mods, &[]).map_err(|err| eyre::eyre!(err))?;
@@ -216,18 +320,20 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         return Err(eyre::eyre!("compilation failed; see diagnostics above"));
     }
 
-    // Copy any hand-written .erl files from mond-std/src/ into the build dir.
-    // These are embedded alongside the .mond sources via include_dir! and are
-    // written verbatim — useful for helpers that are awkward to express in Mond
-    // (e.g. functions that return Erlang atoms like `nomatch`).
-    for file in STD_DIR.files() {
-        if file.path().extension().and_then(|e| e.to_str()) == Some("erl") {
-            let file_name = file.path().file_name().unwrap();
-            let dest = erl_dir.join(file_name);
-            std::fs::write(&dest, file.contents())
-                .with_context(|| format!("could not write {}", dest.display()))?;
-            erl_paths.push(dest);
-        }
+    // Copy any hand-written Erlang helpers bundled with the std dependency.
+    for helper in &std_dep.helper_erls {
+        let dest = erl_dir.join(&helper.file_name);
+        std::fs::write(&dest, &helper.contents)
+            .with_context(|| format!("could not write {}", dest.display()))?;
+        erl_paths.push(dest);
+    }
+
+    // Copy any hand-written Erlang helpers in this project's src/ directory.
+    for helper in &local_helper_erls {
+        let dest = erl_dir.join(&helper.file_name);
+        std::fs::write(&dest, &helper.contents)
+            .with_context(|| format!("could not write {}", dest.display()))?;
+        erl_paths.push(dest);
     }
 
     Ok(ErlSources {
@@ -391,7 +497,8 @@ mod tests {
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(project_dir.join("src")).expect("create src dir");
-        let manifest = crate::manifest::create_new_manifest("app".to_string());
+        let mut manifest = crate::manifest::create_new_manifest("app".to_string());
+        manifest.dependencies.clear();
         crate::manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
             .expect("write manifest");
         std::fs::write(
@@ -491,5 +598,203 @@ mod tests {
         assert!(names.contains(&"io".to_string()));
         assert!(names.contains(&"extra".to_string()));
         assert!(names.contains(&"std".to_string()));
+    }
+
+    #[test]
+    fn register_erl_output_name_rejects_collisions() {
+        let mut seen = HashMap::new();
+        register_erl_output_name(&mut seen, "mond_io", "src/mond_io.mond".to_string())
+            .expect("first insert");
+        let err = register_erl_output_name(
+            &mut seen,
+            "mond_io",
+            "std dependency module `io`".to_string(),
+        )
+        .expect_err("expected collision");
+        assert!(err.to_string().contains("Erlang module name collision"));
+    }
+
+    #[test]
+    fn ensure_no_erl_output_collisions_catches_helper_conflicts() {
+        let user = vec![(
+            "mond_unknown_helpers".to_string(),
+            "(let main {} ())".to_string(),
+        )];
+        let used_std_names: HashSet<String> = HashSet::new();
+        let helpers = vec![deps::HelperErlFile {
+            file_name: "mond_unknown_helpers.erl".to_string(),
+            module_name: "mond_unknown_helpers".to_string(),
+            contents: vec![],
+        }];
+        let err = ensure_no_erl_output_collisions(
+            &user,
+            &HashMap::new(),
+            &[],
+            &used_std_names,
+            &helpers,
+            &[],
+        )
+        .expect_err("expected helper collision");
+        assert!(err.to_string().contains("Erlang module name collision"));
+    }
+
+    #[test]
+    fn generate_erl_sources_copies_local_helper_erls() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let project_dir = root.join("app");
+        std::fs::create_dir_all(project_dir.join("src")).expect("create src dir");
+        let mut manifest = crate::manifest::create_new_manifest("app".to_string());
+        manifest.dependencies.clear();
+        crate::manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
+            .expect("write manifest");
+        std::fs::write(
+            project_dir.join("src").join(crate::LIB_ROOT),
+            r#"(pub let hello {} 1)"#,
+        )
+        .expect("write lib");
+        std::fs::write(
+            project_dir.join("src").join("mond_local_helpers.erl"),
+            "-module(mond_local_helpers).\n-export([hello/0]).\nhello() -> ok.\n",
+        )
+        .expect("write local helper");
+
+        let out_dir = project_dir.join("target/test-build");
+        std::fs::create_dir_all(&out_dir).expect("create output dir");
+        let generated = generate_erl_sources(&project_dir, &out_dir).expect("generate sources");
+        let helper_path = out_dir.join("mond_local_helpers.erl");
+        assert!(helper_path.exists(), "local helper should be copied");
+        assert!(
+            generated.erl_paths.iter().any(|p| p == &helper_path),
+            "generated erl paths should include local helper"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn reserved_local_modules_are_aliased_for_erlang_output() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let project_dir = root.join("app");
+        std::fs::create_dir_all(project_dir.join("src")).expect("create src dir");
+        let mut manifest = crate::manifest::create_new_manifest("app".to_string());
+        manifest.dependencies.clear();
+        crate::manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
+            .expect("write manifest");
+        std::fs::write(
+            project_dir.join("src").join(crate::LIB_ROOT),
+            r#"(pub let main_value {} 1)"#,
+        )
+        .expect("write lib");
+        std::fs::write(
+            project_dir.join("src").join("io.mond"),
+            r#"(pub let println {x} x)"#,
+        )
+        .expect("write io");
+        std::fs::write(
+            project_dir.join("src").join("string.mond"),
+            r#"(pub let concat {x} x)"#,
+        )
+        .expect("write string");
+
+        let out_dir = project_dir.join("target/test-build");
+        std::fs::create_dir_all(&out_dir).expect("create output dir");
+        let generated = generate_erl_sources(&project_dir, &out_dir).expect("generate sources");
+        assert!(
+            generated.erl_paths.iter().any(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "mond_user_io.erl")
+            }),
+            "io module should compile to mond_user_io.erl"
+        );
+        assert!(
+            generated.erl_paths.iter().any(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "mond_user_string.erl")
+            }),
+            "string module should compile to mond_user_string.erl"
+        );
+        assert_eq!(
+            generated.std_aliases.get("io").map(String::as_str),
+            Some("mond_user_io")
+        );
+        assert_eq!(
+            generated.std_aliases.get("string").map(String::as_str),
+            Some("mond_user_string")
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn package_aliases_lib_module_as_package_name() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let project_dir = root.join("time");
+        std::fs::create_dir_all(project_dir.join("src")).expect("create src dir");
+        let mut manifest = crate::manifest::create_new_manifest("time".to_string());
+        manifest.dependencies.clear();
+        crate::manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
+            .expect("write manifest");
+        std::fs::write(
+            project_dir.join("src").join(crate::LIB_ROOT),
+            r#"(pub let now {} 1)"#,
+        )
+        .expect("write lib");
+
+        let out_dir = project_dir.join("target/test-build");
+        std::fs::create_dir_all(&out_dir).expect("create output dir");
+        let generated = generate_erl_sources(&project_dir, &out_dir).expect("generate sources");
+        assert!(generated.module_exports.contains_key("lib"));
+        assert!(generated.module_exports.contains_key("time"));
+        assert_eq!(
+            generated.std_aliases.get("time").map(String::as_str),
+            Some("lib"),
+            "package alias should map to lib module"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn package_alias_errors_when_module_name_conflicts() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let project_dir = root.join("time");
+        std::fs::create_dir_all(project_dir.join("src")).expect("create src dir");
+        let mut manifest = crate::manifest::create_new_manifest("time".to_string());
+        manifest.dependencies.clear();
+        crate::manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
+            .expect("write manifest");
+        std::fs::write(
+            project_dir.join("src").join(crate::LIB_ROOT),
+            r#"(pub let from_lib {} 1)"#,
+        )
+        .expect("write lib");
+        std::fs::write(
+            project_dir.join("src").join("time.mond"),
+            r#"(pub let from_time {} 2)"#,
+        )
+        .expect("write time module");
+
+        let out_dir = project_dir.join("target/test-build");
+        std::fs::create_dir_all(&out_dir).expect("create output dir");
+        let err = match generate_erl_sources(&project_dir, &out_dir) {
+            Ok(_) => panic!("expected alias collision"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("module name collision"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup temp root");
     }
 }

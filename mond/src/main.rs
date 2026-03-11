@@ -1,5 +1,6 @@
 mod build;
 mod clean;
+mod deps;
 mod format;
 mod gitignore;
 mod manifest;

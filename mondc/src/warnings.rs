@@ -411,6 +411,25 @@ fn collect_decl_type_usage_names(decl: &ast::TypeDecl, out: &mut HashSet<String>
     }
 }
 
+fn collect_type_sig_usage_names(sig: &ast::TypeSig, out: &mut HashSet<String>) {
+    match sig {
+        ast::TypeSig::Named(name) => {
+            out.insert(name.clone());
+        }
+        ast::TypeSig::Generic(_) => {}
+        ast::TypeSig::App(head, args) => {
+            out.insert(head.clone());
+            for arg in args {
+                collect_type_sig_usage_names(arg, out);
+            }
+        }
+        ast::TypeSig::Fun(a, b) => {
+            collect_type_sig_usage_names(a, out);
+            collect_type_sig_usage_names(b, out);
+        }
+    }
+}
+
 fn used_unqualified_names(decls: &[ast::Declaration]) -> HashSet<String> {
     let mut used = HashSet::new();
     let empty_locals = HashSet::new();
@@ -428,6 +447,9 @@ fn used_unqualified_names(decls: &[ast::Declaration]) -> HashSet<String> {
             }
             ast::Declaration::Type(type_decl) => {
                 collect_decl_type_usage_names(type_decl, &mut used);
+            }
+            ast::Declaration::ExternLet { ty, .. } => {
+                collect_type_sig_usage_names(ty, &mut used);
             }
             _ => {}
         }

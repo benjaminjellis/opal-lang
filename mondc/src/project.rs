@@ -92,6 +92,55 @@ pub fn build_project_analysis(
     })
 }
 
+pub fn alias_package_root_module(
+    analysis: &mut ProjectAnalysis,
+    package_name: &str,
+) -> Result<(), String> {
+    const LIB_MODULE_NAME: &str = "lib";
+
+    if package_name == LIB_MODULE_NAME {
+        return Ok(());
+    }
+
+    let Some(lib_exports) = analysis.module_exports.get(LIB_MODULE_NAME).cloned() else {
+        return Ok(());
+    };
+
+    if analysis.module_exports.contains_key(package_name)
+        || analysis.module_type_decls.contains_key(package_name)
+        || analysis.all_module_schemes.contains_key(package_name)
+    {
+        return Err(format!(
+            "module name collision: package `{package_name}` conflicts with an existing module name; cannot alias `src/lib.mond` as `{package_name}`"
+        ));
+    }
+
+    analysis
+        .module_exports
+        .insert(package_name.to_string(), lib_exports);
+    analysis.module_type_decls.insert(
+        package_name.to_string(),
+        analysis
+            .module_type_decls
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    analysis.all_module_schemes.insert(
+        package_name.to_string(),
+        analysis
+            .all_module_schemes
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    analysis
+        .std_aliases
+        .insert(package_name.to_string(), LIB_MODULE_NAME.to_string());
+
+    Ok(())
+}
+
 pub fn resolve_imports_for_source(
     source: &str,
     visible_exports: &HashMap<String, Vec<String>>,
@@ -100,6 +149,8 @@ pub fn resolve_imports_for_source(
     let mut imports = HashMap::new();
     let mut import_origins = HashMap::new();
     let mut imported_schemes = HashMap::new();
+    let mut imported_type_decls = Vec::new();
+    let mut imported_type_keys: HashSet<(String, String)> = HashSet::new();
 
     for (_, mod_name, unqualified) in crate::used_modules(source) {
         let erlang_name = project
@@ -125,18 +176,53 @@ pub fn resolve_imports_for_source(
                 imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
             }
         }
-    }
 
-    let imported_type_decls: Vec<crate::ast::TypeDecl> = referenced_modules(source)
-        .into_iter()
-        .flat_map(|mod_name| {
-            project
-                .module_type_decls
-                .get(&mod_name)
-                .cloned()
-                .unwrap_or_default()
-        })
-        .collect();
+        if let Some(type_decls) = project.module_type_decls.get(&mod_name) {
+            // Field accessors (for example `:value`) should remain usable when a module is
+            // referenced, even if constructors require explicit unqualified type import.
+            for type_decl in type_decls {
+                if matches!(type_decl, crate::ast::TypeDecl::Record { .. }) {
+                    let accessor_schemes = crate::typecheck::constructor_schemes(type_decl);
+                    for (name, scheme) in accessor_schemes {
+                        if name.starts_with(':') {
+                            imported_schemes.insert(name, scheme);
+                        }
+                    }
+                }
+            }
+
+            match &unqualified {
+                crate::ast::UnqualifiedImports::None => {}
+                crate::ast::UnqualifiedImports::Wildcard => {
+                    for type_decl in type_decls {
+                        let type_name = match type_decl {
+                            crate::ast::TypeDecl::Record { name, .. } => name.clone(),
+                            crate::ast::TypeDecl::Variant { name, .. } => name.clone(),
+                        };
+                        let key = (mod_name.clone(), type_name);
+                        if imported_type_keys.insert(key) {
+                            imported_type_decls.push(type_decl.clone());
+                        }
+                    }
+                }
+                crate::ast::UnqualifiedImports::Specific(names) => {
+                    for type_decl in type_decls {
+                        let type_name = match type_decl {
+                            crate::ast::TypeDecl::Record { name, .. } => name,
+                            crate::ast::TypeDecl::Variant { name, .. } => name,
+                        };
+                        if !names.iter().any(|n| n == type_name) {
+                            continue;
+                        }
+                        let key = (mod_name.clone(), type_name.clone());
+                        if imported_type_keys.insert(key) {
+                            imported_type_decls.push(type_decl.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     ResolvedImports {
         imports,
@@ -324,5 +410,46 @@ mod tests {
 
         assert_eq!(resolved.imports.get("hello"), Some(&"mond_std".to_string()));
         assert!(!resolved.imports.contains_key("println"));
+    }
+
+    #[test]
+    fn alias_package_root_module_maps_package_name_to_lib() {
+        let mut analysis = ProjectAnalysis {
+            module_exports: HashMap::from([
+                ("lib".to_string(), vec!["now".to_string()]),
+                ("util".to_string(), vec!["helper".to_string()]),
+            ]),
+            module_type_decls: HashMap::new(),
+            all_module_schemes: HashMap::new(),
+            std_aliases: HashMap::new(),
+        };
+
+        alias_package_root_module(&mut analysis, "time").expect("alias package root module");
+
+        assert!(analysis.module_exports.contains_key("time"));
+        assert_eq!(
+            analysis.std_aliases.get("time").map(String::as_str),
+            Some("lib")
+        );
+    }
+
+    #[test]
+    fn alias_package_root_module_rejects_name_collisions() {
+        let mut analysis = ProjectAnalysis {
+            module_exports: HashMap::from([
+                ("lib".to_string(), vec!["now".to_string()]),
+                ("time".to_string(), vec!["from_time".to_string()]),
+            ]),
+            module_type_decls: HashMap::new(),
+            all_module_schemes: HashMap::new(),
+            std_aliases: HashMap::new(),
+        };
+
+        let err =
+            alias_package_root_module(&mut analysis, "time").expect_err("expected alias collision");
+        assert!(
+            err.contains("module name collision"),
+            "unexpected error: {err}"
+        );
     }
 }
