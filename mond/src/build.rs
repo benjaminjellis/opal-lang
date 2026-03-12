@@ -44,7 +44,7 @@ fn apply_reserved_local_module_aliases(
 ) {
     for (module_name, _) in module_sources {
         if let Some(alias) = reserved_local_erlang_alias(module_name) {
-            analysis.std_aliases.insert(module_name.clone(), alias);
+            analysis.module_aliases.insert(module_name.clone(), alias);
         }
     }
 }
@@ -144,12 +144,73 @@ pub(crate) struct ErlSources {
     pub module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>>,
     pub all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv>,
     pub std_mods: Vec<(String, String, String)>,
-    pub std_aliases: HashMap<String, String>,
+    pub module_aliases: HashMap<String, String>,
+}
+
+fn entry_module_names(project_type: &ProjectType) -> Vec<String> {
+    match project_type {
+        ProjectType::Bin => vec!["main".to_string()],
+        ProjectType::Lib => vec!["lib".to_string()],
+    }
+}
+
+fn reachable_src_modules(
+    project_type: &ProjectType,
+    module_sources: &[(String, String)],
+    extra_roots: &[String],
+) -> eyre::Result<Vec<(String, String)>> {
+    let mut roots = entry_module_names(project_type);
+    for root in extra_roots {
+        if !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    mondc::reachable_module_sources(module_sources, &roots).map_err(|err| eyre::eyre!(err))
+}
+
+pub(crate) fn reachable_std_modules(
+    std_mods: &[(String, String, String)],
+    roots: &HashSet<String>,
+) -> eyre::Result<Vec<(String, String, String)>> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let std_sources: Vec<(String, String)> = std_mods
+        .iter()
+        .map(|(user_name, _, source)| (user_name.clone(), source.clone()))
+        .collect();
+    let root_list: Vec<String> = roots.iter().cloned().collect();
+    let reachable =
+        mondc::reachable_module_sources(&std_sources, &root_list).map_err(|err| eyre::eyre!(err))?;
+    let erlang_names: HashMap<String, String> = std_mods
+        .iter()
+        .map(|(user_name, erlang_name, _)| (user_name.clone(), erlang_name.clone()))
+        .collect();
+
+    Ok(reachable
+        .into_iter()
+        .map(|(user_name, source)| {
+            let erlang_name = erlang_names
+                .get(&user_name)
+                .cloned()
+                .unwrap_or_else(|| format!("mond_{user_name}"));
+            (user_name, erlang_name, source)
+        })
+        .collect())
 }
 
 /// Compile all Mond source files and write `.erl` output into `erl_dir`.
 /// Returns the generated file paths, the project manifest, and detected project type.
 pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::Result<ErlSources> {
+    generate_erl_sources_with_roots(project_dir, erl_dir, &[])
+}
+
+pub(crate) fn generate_erl_sources_with_roots(
+    project_dir: &Path,
+    erl_dir: &Path,
+    extra_roots: &[String],
+) -> eyre::Result<ErlSources> {
     let manifest = manifest::read_manifest(project_dir.into())?;
     let std_dep = deps::load_std_dependency(project_dir, &manifest)?;
     let std_mods = std_dep.modules.clone();
@@ -201,17 +262,29 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
     module_exports = analysis.module_exports.clone();
     module_type_decls = analysis.module_type_decls.clone();
     let all_module_schemes = analysis.all_module_schemes.clone();
-    let std_aliases = analysis.std_aliases.clone();
+    let module_aliases = analysis.module_aliases.clone();
+    let selected_module_sources =
+        reachable_src_modules(&project_type, &ordered_module_sources, extra_roots)?;
 
     // Compile only std modules that are actually used.
-    let used_std_names: HashSet<String> = ordered_module_sources
+    let known_std_names: HashSet<String> = std_mods
+        .iter()
+        .map(|(user_name, _, _)| user_name.clone())
+        .collect();
+    let direct_std_roots: HashSet<String> = selected_module_sources
         .iter()
         .flat_map(|(_, src)| mondc::used_modules(src))
         .map(|(_, m, _)| m)
+        .filter(|module_name| known_std_names.contains(module_name))
+        .collect();
+    let selected_std_mods = reachable_std_modules(&std_mods, &direct_std_roots)?;
+    let used_std_names: HashSet<String> = selected_std_mods
+        .iter()
+        .map(|(user_name, _, _)| user_name.clone())
         .collect();
     ensure_no_erl_output_collisions(
-        &ordered_module_sources,
-        &std_aliases,
+        &selected_module_sources,
+        &module_aliases,
         &std_mods,
         &used_std_names,
         &std_dep.helper_erls,
@@ -221,7 +294,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
     // Phase 2: compile each user file with its resolved import map
     let mut erl_paths: Vec<PathBuf> = Vec::new();
     let mut had_error = false;
-    for (module_name, source) in &ordered_module_sources {
+    for (module_name, source) in &selected_module_sources {
         let resolved = mondc::resolve_imports_for_source(source, &module_exports, &analysis);
         let erlang_module_name = resolved
             .module_aliases
@@ -261,7 +334,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         return Err(eyre::eyre!("compilation failed; see diagnostics above"));
     }
 
-    validate_bin_entrypoint(&project_type, &module_sources)?;
+    validate_bin_entrypoint(&project_type, &selected_module_sources)?;
 
     let std_analysis =
         mondc::build_project_analysis(&std_mods, &[]).map_err(|err| eyre::eyre!(err))?;
@@ -279,10 +352,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         })
         .collect();
 
-    for (user_name, erlang_name, source) in &std_mods {
-        if !used_std_names.contains(user_name.as_str()) {
-            continue;
-        }
+    for (_, erlang_name, source) in &selected_std_mods {
         let resolved =
             mondc::resolve_imports_for_source(source, &std_module_exports, &std_analysis);
 
@@ -292,7 +362,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
             &format!("{erlang_name}.mond"),
             resolved.imports,
             &std_module_exports,
-            std_analysis.std_aliases.clone(),
+            std_analysis.module_aliases.clone(),
             &resolved.imported_type_decls,
             &resolved.imported_schemes,
         );
@@ -344,7 +414,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         module_type_decls,
         all_module_schemes,
         std_mods,
-        std_aliases,
+        module_aliases,
     })
 }
 
@@ -601,6 +671,33 @@ mod tests {
     }
 
     #[test]
+    fn reachable_std_modules_include_transitive_dependencies() {
+        let std_mods = vec![
+            (
+                "list".to_string(),
+                "mond_list".to_string(),
+                "(pub let map {f xs} xs)".to_string(),
+            ),
+            (
+                "io".to_string(),
+                "mond_io".to_string(),
+                "(use list)\n(pub let println {x} (list/map x))".to_string(),
+            ),
+            (
+                "unused".to_string(),
+                "mond_unused".to_string(),
+                "(pub let noop {} ())".to_string(),
+            ),
+        ];
+
+        let selected = reachable_std_modules(&std_mods, &HashSet::from(["io".to_string()]))
+            .expect("reachable std modules");
+        let names: Vec<String> = selected.into_iter().map(|(name, _, _)| name).collect();
+
+        assert_eq!(names, vec!["list", "io"]);
+    }
+
+    #[test]
     fn register_erl_output_name_rejects_collisions() {
         let mut seen = HashMap::new();
         register_erl_output_name(&mut seen, "mond_io", "src/mond_io.mond".to_string())
@@ -686,7 +783,10 @@ mod tests {
             .expect("write manifest");
         std::fs::write(
             project_dir.join("src").join(crate::LIB_ROOT),
-            r#"(pub let main_value {} 1)"#,
+            r#"(use io)
+(use string)
+
+(pub let main_value {} (string/concat (io/println 1)))"#,
         )
         .expect("write lib");
         std::fs::write(
@@ -720,11 +820,11 @@ mod tests {
             "string module should compile to mond_user_string.erl"
         );
         assert_eq!(
-            generated.std_aliases.get("io").map(String::as_str),
+            generated.module_aliases.get("io").map(String::as_str),
             Some("mond_user_io")
         );
         assert_eq!(
-            generated.std_aliases.get("string").map(String::as_str),
+            generated.module_aliases.get("string").map(String::as_str),
             Some("mond_user_string")
         );
 
@@ -754,7 +854,7 @@ mod tests {
         assert!(generated.module_exports.contains_key("lib"));
         assert!(generated.module_exports.contains_key("time"));
         assert_eq!(
-            generated.std_aliases.get("time").map(String::as_str),
+            generated.module_aliases.get("time").map(String::as_str),
             Some("lib"),
             "package alias should map to lib module"
         );

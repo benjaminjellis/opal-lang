@@ -4,7 +4,7 @@ use eyre::Context;
 
 use crate::{
     TARGET_DIR, TEST_BUILD_DIR,
-    build::{ErlSources, generate_erl_sources},
+    build::{ErlSources, generate_erl_sources_with_roots, reachable_std_modules},
     ui,
     utils::find_mond_files,
 };
@@ -23,17 +23,6 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let build_dir = project_dir.join(TARGET_DIR).join(TEST_BUILD_DIR);
     prepare_test_build_dir(&build_dir)?;
 
-    // Compile src/ modules and get compilation state
-    let ErlSources {
-        mut erl_paths,
-        module_exports,
-        module_type_decls,
-        all_module_schemes,
-        std_mods,
-        std_aliases,
-        ..
-    } = generate_erl_sources(project_dir, &build_dir)?;
-
     let test_dir = project_dir.join(TEST_DIR);
     if !test_dir.exists() {
         ui::warn("no tests/ directory found");
@@ -46,10 +35,17 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         return Ok(());
     }
 
+    let src_dir = project_dir.join(crate::SOURCE_DIR);
+    let src_module_names: std::collections::HashSet<String> = find_mond_files(&src_dir)
+        .into_iter()
+        .filter_map(|path| path.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect();
+
     // Scan test files to collect their exports and sources
     let mut test_module_sources: Vec<(String, String)> = Vec::new();
     let mut test_module_exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut seen_test_modules: HashMap<String, std::path::PathBuf> = HashMap::new();
+    let mut extra_src_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for test_path in &test_files {
         let module_name = test_path
@@ -70,8 +66,28 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
         let exports = mondc::exported_names(&source);
         test_module_exports.insert(module_name.clone(), exports);
+        for module_name in mondc::referenced_modules(&source) {
+            if src_module_names.contains(&module_name) {
+                extra_src_roots.insert(module_name);
+            }
+        }
         test_module_sources.push((module_name, source));
     }
+
+    // Compile src/ modules and get compilation state.
+    let ErlSources {
+        mut erl_paths,
+        module_exports,
+        module_type_decls,
+        all_module_schemes,
+        std_mods,
+        module_aliases,
+        ..
+    } = generate_erl_sources_with_roots(
+        project_dir,
+        &build_dir,
+        &extra_src_roots.into_iter().collect::<Vec<_>>(),
+    )?;
 
     // Combined export map: std + src + test modules
     let mut all_exports = module_exports.clone();
@@ -92,7 +108,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         module_exports: all_exports.clone(),
         module_type_decls: module_type_decls.clone(),
         all_module_schemes: all_module_schemes.clone(),
-        std_aliases: std_aliases.clone(),
+        module_aliases: module_aliases.clone(),
     };
     // (module_name, Vec<(display_name, erlang_fn_name)>)
     let mut test_fns_by_module: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -155,13 +171,11 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             }
         }
     }
+    let selected_test_std_mods = reachable_std_modules(&std_mods, &needed_std)?;
 
     let std_analysis =
         mondc::build_project_analysis(&std_mods, &[]).map_err(|err| eyre::eyre!(err))?;
-    for (user_name, erlang_name, source) in &std_mods {
-        if !needed_std.contains(user_name.as_str()) {
-            continue;
-        }
+    for (user_name, erlang_name, source) in &selected_test_std_mods {
         let erl_path = build_dir.join(format!("{erlang_name}.erl"));
         if erl_path.exists() {
             if erl_paths.iter().any(|p| p == &erl_path) {
@@ -182,7 +196,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &format!("{erlang_name}.mond"),
             resolved.imports,
             &std_module_exports,
-            std_analysis.std_aliases.clone(),
+            std_analysis.module_aliases.clone(),
             &resolved.imported_type_decls,
             &resolved.imported_schemes,
         );

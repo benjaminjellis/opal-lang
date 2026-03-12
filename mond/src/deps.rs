@@ -6,7 +6,11 @@ use std::{
 use eyre::Context;
 use walkdir::WalkDir;
 
-use crate::{SOURCE_DIR, TARGET_DIR, manifest, utils::find_mond_files};
+use crate::{
+    SOURCE_DIR, TARGET_DIR, manifest,
+    ui::{info, success},
+    utils::find_mond_files,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct HelperErlFile {
@@ -33,10 +37,35 @@ pub(crate) fn load_std_dependency(
     load_std_from_checkout(&checkout_dir)
 }
 
+pub(crate) fn update_dependencies(project_dir: &Path) -> eyre::Result<Vec<String>> {
+    let manifest = manifest::read_manifest(project_dir.to_path_buf())?;
+    let mut updated = Vec::new();
+
+    let mut dep_names: Vec<String> = manifest.dependencies.keys().cloned().collect();
+    dep_names.sort();
+
+    for dep_name in dep_names {
+        let dep_spec = &manifest.dependencies[&dep_name];
+        checkout_dependency_with_policy(project_dir, &dep_name, dep_spec, true)?;
+        updated.push(dep_name);
+    }
+
+    Ok(updated)
+}
+
 fn checkout_dependency(
     project_dir: &Path,
     dep_name: &str,
     dep_spec: &manifest::DependencySpec,
+) -> eyre::Result<PathBuf> {
+    checkout_dependency_with_policy(project_dir, dep_name, dep_spec, false)
+}
+
+fn checkout_dependency_with_policy(
+    project_dir: &Path,
+    dep_name: &str,
+    dep_spec: &manifest::DependencySpec,
+    refresh: bool,
 ) -> eyre::Result<PathBuf> {
     let deps_dir = project_dir.join(TARGET_DIR).join("deps");
     std::fs::create_dir_all(&deps_dir).with_context(|| {
@@ -48,19 +77,25 @@ fn checkout_dependency(
 
     let checkout_dir = deps_dir.join(dep_name);
     let git_dir = checkout_dir.join(".git");
+    let git_dir_exists = git_dir.exists();
 
-    if git_dir.exists() {
-        run_git(
-            Some(&checkout_dir),
-            &["fetch", "--quiet", "--tags", "--prune", "origin"],
-            "failed to fetch dependency",
-        )?;
+    if git_dir_exists {
+        if refresh {
+            info(&format!("Fetching dependency: {dep_name}"));
+            run_git(
+                Some(&checkout_dir),
+                &["fetch", "--quiet", "--tags", "--prune", "origin"],
+                "failed to fetch dependency",
+            )?;
+            success(&format!("Fetched dependency: {dep_name}"));
+        }
     } else if checkout_dir.exists() {
         return Err(eyre::eyre!(
             "dependency cache path {} exists but is not a git repository; remove it and retry",
             checkout_dir.display()
         ));
     } else {
+        info(&format!("Cloning dependency: {dep_name}"));
         run_git(
             None,
             &[
@@ -74,17 +109,34 @@ fn checkout_dependency(
             ],
             "failed to clone dependency",
         )?;
+
+        success(&format!("Cloned dependency: {dep_name}"));
+    }
+
+    // if the git dir already existed and we didn't refresh we're already on the right tag
+    if git_dir_exists && !refresh {
+        return Ok(checkout_dir);
     }
 
     match &dep_spec.reference {
         manifest::GitReference::Tag(tag) => {
+            info(&format!(
+                "Checking out dependency: {dep_name} using tag: {tag}"
+            ));
             run_git(
                 Some(&checkout_dir),
                 &["checkout", "--quiet", &format!("refs/tags/{tag}")],
                 "failed to checkout dependency tag",
             )?;
+            success(&format!(
+                "Checked out dependency: {dep_name} using tag: {tag}"
+            ));
         }
         manifest::GitReference::Branch(branch) => {
+            info(&format!(
+                "Checking our dependency: {dep_name} using branch: {branch}"
+            ));
+
             run_git(
                 Some(&checkout_dir),
                 &[
@@ -96,13 +148,24 @@ fn checkout_dependency(
                 ],
                 "failed to checkout dependency branch",
             )?;
+
+            success(&format!(
+                "Checked out dependency: {dep_name} using brach: {branch}"
+            ));
         }
         manifest::GitReference::Rev(rev) => {
+            info(&format!(
+                "Checking out dependency: {dep_name} using rev: {rev}"
+            ));
+
             run_git(
                 Some(&checkout_dir),
                 &["checkout", "--quiet", rev],
                 "failed to checkout dependency revision",
             )?;
+            success(&format!(
+                "Checked out dependency: {dep_name} using rev: {rev}"
+            ));
         }
     }
 
@@ -319,6 +382,86 @@ mond_version = "0.1.0"
                 .helper_erls
                 .iter()
                 .any(|h| h.file_name == "mond_std_helpers.erl")
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn load_std_dependency_uses_cached_checkout_without_fetching() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create root");
+        let std_repo = root.join("std-src");
+        let std_src_dir = std_repo.join("src");
+        std::fs::create_dir_all(&std_src_dir).expect("create std src");
+        std::fs::write(
+            std_repo.join("mond.toml"),
+            r#"[package]
+name = "std"
+version = "0.0.1"
+mond_version = "0.1.0"
+
+[dependencies]
+"#,
+        )
+        .expect("write std manifest");
+        std::fs::write(std_src_dir.join("lib.mond"), "(pub let hello {} \"hello\")")
+            .expect("write lib.mond");
+
+        run_ok(Command::new("git").arg("init").current_dir(&std_repo));
+        run_ok(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&std_repo),
+        );
+        run_ok(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "user.name=test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ])
+                .current_dir(&std_repo),
+        );
+        run_ok(
+            Command::new("git")
+                .args(["tag", "0.0.1"])
+                .current_dir(&std_repo),
+        );
+
+        let project_dir = root.join("app");
+        std::fs::create_dir_all(&project_dir).expect("create project");
+        let manifest = manifest::MondManifest {
+            package: manifest::Package {
+                name: "app".to_string(),
+                version: Version::new(0, 1, 0),
+                mond_version: Version::new(0, 1, 0),
+            },
+            dependencies: std::collections::HashMap::from([(
+                "std".to_string(),
+                manifest::DependencySpec {
+                    git: format!("file://{}", std_repo.display()),
+                    reference: manifest::GitReference::Tag("0.0.1".to_string()),
+                },
+            )]),
+        };
+
+        let initial = load_std_dependency(&project_dir, &manifest).expect("initial load");
+        assert!(
+            initial.modules.iter().any(|(name, _, _)| name == "std"),
+            "expected initial clone to load std"
+        );
+
+        std::fs::remove_dir_all(&std_repo).expect("remove remote repo");
+
+        let cached = load_std_dependency(&project_dir, &manifest).expect("cached load");
+        assert!(
+            cached.modules.iter().any(|(name, _, _)| name == "std"),
+            "expected cached checkout to be used without fetching"
         );
 
         std::fs::remove_dir_all(root).expect("cleanup");

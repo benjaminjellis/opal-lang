@@ -42,6 +42,10 @@ struct Cli {
 enum Commands {
     Run,
     Test,
+    Deps {
+        #[arg(long)]
+        update: bool,
+    },
     Lsp,
     Format {
         #[arg(long)]
@@ -87,6 +91,18 @@ fn main() -> eyre::Result<()> {
         }
         Commands::Test => {
             test::test(root)?;
+        }
+        Commands::Deps { update } => {
+            if update {
+                let updated = deps::update_dependencies(root)?;
+                if updated.is_empty() {
+                    ui::success("no dependencies to update");
+                } else {
+                    ui::success(&format!("updated {}", updated.join(", ")));
+                }
+            } else {
+                ui::info("dependency cache is offline by default; run `mond deps --update` to refresh");
+            }
         }
         Commands::Lsp => {
             tokio::runtime::Runtime::new()?.block_on(async {

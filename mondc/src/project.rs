@@ -5,7 +5,7 @@ pub struct ProjectAnalysis {
     pub module_exports: HashMap<String, Vec<String>>,
     pub module_type_decls: HashMap<String, Vec<crate::ast::TypeDecl>>,
     pub all_module_schemes: HashMap<String, crate::typecheck::TypeEnv>,
-    pub std_aliases: HashMap<String, String>,
+    pub module_aliases: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,7 +33,7 @@ pub fn build_project_analysis(
         module_type_decls.insert(module_name.clone(), crate::exported_type_decls(source));
     }
 
-    let std_aliases: HashMap<String, String> = std_mods
+    let module_aliases: HashMap<String, String> = std_mods
         .iter()
         .map(|(user_name, erlang_name, _)| (user_name.clone(), erlang_name.clone()))
         .collect();
@@ -47,7 +47,7 @@ pub fn build_project_analysis(
                 module_exports: module_exports.clone(),
                 module_type_decls: module_type_decls.clone(),
                 all_module_schemes: all_module_schemes.clone(),
-                std_aliases: std_aliases.clone(),
+                module_aliases: module_aliases.clone(),
             },
         );
         let schemes = crate::infer_module_exports(
@@ -70,7 +70,7 @@ pub fn build_project_analysis(
                 module_exports: module_exports.clone(),
                 module_type_decls: module_type_decls.clone(),
                 all_module_schemes: all_module_schemes.clone(),
-                std_aliases: std_aliases.clone(),
+                module_aliases: module_aliases.clone(),
             },
         );
         let schemes = crate::infer_module_exports(
@@ -88,7 +88,7 @@ pub fn build_project_analysis(
         module_exports,
         module_type_decls,
         all_module_schemes,
-        std_aliases,
+        module_aliases,
     })
 }
 
@@ -135,7 +135,7 @@ pub fn alias_package_root_module(
             .unwrap_or_default(),
     );
     analysis
-        .std_aliases
+        .module_aliases
         .insert(package_name.to_string(), LIB_MODULE_NAME.to_string());
 
     Ok(())
@@ -154,7 +154,7 @@ pub fn resolve_imports_for_source(
 
     for (_, mod_name, unqualified) in crate::used_modules(source) {
         let erlang_name = project
-            .std_aliases
+            .module_aliases
             .get(&mod_name)
             .cloned()
             .unwrap_or_else(|| mod_name.clone());
@@ -229,7 +229,7 @@ pub fn resolve_imports_for_source(
         import_origins,
         imported_schemes,
         imported_type_decls,
-        module_aliases: project.std_aliases.clone(),
+        module_aliases: project.module_aliases.clone(),
     }
 }
 
@@ -259,20 +259,36 @@ pub fn ordered_module_sources(
         );
     }
 
-    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (module_name, source) in &source_by_name {
-        let mut deps: BTreeSet<String> = BTreeSet::new();
-        for (namespace, dep, _) in crate::used_modules(source) {
-            if namespace.is_empty() && source_by_name.contains_key(&dep) {
-                deps.insert(dep);
-            }
-        }
-        graph.insert(module_name.clone(), deps.into_iter().collect());
-    }
+    let graph = local_module_graph(&source_by_name);
 
     let order = topo_sort_modules(&graph)?;
     Ok(order
         .into_iter()
+        .filter_map(|name| source_by_name.get(&name).cloned().map(|src| (name, src)))
+        .collect())
+}
+
+pub fn reachable_module_sources(
+    module_sources: &[(String, String)],
+    roots: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let source_by_name: BTreeMap<String, String> = module_sources
+        .iter()
+        .map(|(name, src)| (name.clone(), src.clone()))
+        .collect();
+    if source_by_name.len() != module_sources.len() {
+        return Err(
+            "duplicate module names found in src/: module file stems must be unique".into(),
+        );
+    }
+
+    let graph = local_module_graph(&source_by_name);
+    let order = topo_sort_modules(&graph)?;
+    let reachable = reachable_modules(&graph, roots)?;
+
+    Ok(order
+        .into_iter()
+        .filter(|name| reachable.contains(name))
         .filter_map(|name| source_by_name.get(&name).cloned().map(|src| (name, src)))
         .collect())
 }
@@ -284,11 +300,7 @@ pub fn std_modules_from_sources(
     Ok(ordered
         .into_iter()
         .map(|(user_name, source)| {
-            let erlang_name = if user_name == "std" {
-                "mond_std".to_string()
-            } else {
-                format!("mond_{user_name}")
-            };
+            let erlang_name = format!("mond_{user_name}");
             (user_name, erlang_name, source)
         })
         .collect())
@@ -341,6 +353,48 @@ fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> Result<Vec<String
     Ok(out)
 }
 
+fn local_module_graph(source_by_name: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (module_name, source) in source_by_name {
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        for (namespace, dep, _) in crate::used_modules(source) {
+            if namespace.is_empty() && source_by_name.contains_key(&dep) {
+                deps.insert(dep);
+            }
+        }
+        graph.insert(module_name.clone(), deps.into_iter().collect());
+    }
+    graph
+}
+
+fn reachable_modules(
+    graph: &BTreeMap<String, Vec<String>>,
+    roots: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let mut reachable = BTreeSet::new();
+    let mut stack: Vec<String> = Vec::new();
+
+    for root in roots {
+        if !graph.contains_key(root) {
+            return Err(format!(
+                "module `{root}` was selected as a build root but does not exist in src/"
+            ));
+        }
+        stack.push(root.clone());
+    }
+
+    while let Some(module_name) = stack.pop() {
+        if !reachable.insert(module_name.clone()) {
+            continue;
+        }
+        for dep in graph.get(&module_name).into_iter().flatten() {
+            stack.push(dep.clone());
+        }
+    }
+
+    Ok(reachable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn reachable_module_sources_only_keeps_transitive_dependencies_of_roots() {
+        let modules = vec![
+            (
+                "main".to_string(),
+                "(use util)\n(let main {} (util_fn))".to_string(),
+            ),
+            (
+                "util".to_string(),
+                "(use helper)\n(let util_fn {} (helper_fn))".to_string(),
+            ),
+            ("helper".to_string(), "(let helper_fn {} 1)".to_string()),
+            ("unused".to_string(), "(let ignore_me {} 2)".to_string()),
+        ];
+
+        let ordered = reachable_module_sources(&modules, &["main".to_string()]).expect("roots");
+        let names: Vec<String> = ordered.into_iter().map(|(n, _)| n).collect();
+
+        assert_eq!(names, vec!["helper", "util", "main"]);
+    }
+
+    #[test]
     fn std_modules_from_sources_discovers_files_without_root_reexports() {
         let modules = vec![
             ("io".to_string(), "(let println {x} x)".to_string()),
@@ -393,9 +468,9 @@ mod tests {
         exports.insert("std".to_string(), vec!["hello".to_string()]);
         exports.insert("io".to_string(), vec!["println".to_string()]);
 
-        let mut std_aliases = HashMap::new();
-        std_aliases.insert("std".to_string(), "mond_std".to_string());
-        std_aliases.insert("io".to_string(), "mond_io".to_string());
+        let mut module_aliases = HashMap::new();
+        module_aliases.insert("std".to_string(), "mond_std".to_string());
+        module_aliases.insert("io".to_string(), "mond_io".to_string());
 
         let resolved = resolve_imports_for_source(
             "(use std [hello])\n(use std/io)\n(let main {} (hello))",
@@ -404,7 +479,7 @@ mod tests {
                 module_exports: exports.clone(),
                 module_type_decls: HashMap::new(),
                 all_module_schemes: HashMap::new(),
-                std_aliases,
+                module_aliases,
             },
         );
 
@@ -421,14 +496,14 @@ mod tests {
             ]),
             module_type_decls: HashMap::new(),
             all_module_schemes: HashMap::new(),
-            std_aliases: HashMap::new(),
+            module_aliases: HashMap::new(),
         };
 
         alias_package_root_module(&mut analysis, "time").expect("alias package root module");
 
         assert!(analysis.module_exports.contains_key("time"));
         assert_eq!(
-            analysis.std_aliases.get("time").map(String::as_str),
+            analysis.module_aliases.get("time").map(String::as_str),
             Some("lib")
         );
     }
@@ -442,7 +517,7 @@ mod tests {
             ]),
             module_type_decls: HashMap::new(),
             all_module_schemes: HashMap::new(),
-            std_aliases: HashMap::new(),
+            module_aliases: HashMap::new(),
         };
 
         let err =
