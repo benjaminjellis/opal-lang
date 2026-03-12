@@ -18,8 +18,8 @@ pub use compiler::{
 };
 pub use project::{
     ProjectAnalysis, ResolvedImports, alias_package_root_module, build_project_analysis,
-    ordered_module_sources, reachable_module_sources, referenced_modules, resolve_imports_for_source,
-    std_modules_from_sources,
+    ordered_module_sources, reachable_module_sources, referenced_modules,
+    resolve_imports_for_source, std_modules_from_sources,
 };
 pub use query::{
     exported_names, exported_type_decls, has_nullary_main, infer_module_bindings,

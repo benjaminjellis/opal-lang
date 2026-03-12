@@ -8,6 +8,21 @@ use crate::{
     ui,
 };
 
+fn sanitize_erlang_component(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() || sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        sanitized.insert(0, '_');
+    }
+    sanitized
+}
+
 pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     // Stage the rebar3 project under target/release/
     // Wipe first to prevent stale .erl files from previous builds causing conflicts.
@@ -22,6 +37,7 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
         erl_paths: _,
         manifest,
         project_type,
+        module_aliases,
         ..
     } = generate_erl_sources(project_dir, &src_dir)?;
 
@@ -29,11 +45,16 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
         return Err(eyre::eyre!("mond cannot release a library project"));
     }
 
-    // Sanitise project name to a valid Erlang atom (replace hyphens with underscores)
-    let app_name = manifest.package.name.replace('-', "_");
+    // Sanitise project name to a valid Erlang atom component.
+    let app_name = sanitize_erlang_component(&manifest.package.name);
     let version = manifest.package.version.to_string();
 
-    // Generate the escript entry-point shim: <app_name>:main/1 calls our main:main(unit)
+    let main_module = module_aliases
+        .get("main")
+        .map(String::as_str)
+        .unwrap_or("main");
+
+    // Generate the escript entry-point shim: <app_name>:main/1 calls the compiled main module.
     let shim_path = src_dir.join(format!("{app_name}.erl"));
     if shim_path.exists() {
         return Err(eyre::eyre!(
@@ -46,7 +67,7 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
          -export([main/1]).\n\
          \n\
          main(_Args) ->\n\
-             main:main(unit).\n"
+             {main_module}:main(unit).\n"
     );
     std::fs::write(&shim_path, shim).context("could not write escript shim")?;
 

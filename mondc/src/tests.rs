@@ -41,6 +41,7 @@ fn qualified_std_call_requires_use() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(without_use_result.is_none());
 
@@ -53,6 +54,7 @@ fn qualified_std_call_requires_use() {
         &module_exports,
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(with_use_result.is_some());
@@ -74,6 +76,7 @@ fn duplicate_unqualified_imports_error() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(result.is_none());
 }
@@ -89,6 +92,7 @@ fn duplicate_top_level_function_defs_error() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(result.is_none());
@@ -106,6 +110,7 @@ fn duplicate_record_fields_error() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(result.is_none());
 }
@@ -121,6 +126,7 @@ fn duplicate_variant_constructors_error() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(result.is_none());
@@ -141,6 +147,7 @@ fn duplicate_variant_constructors_across_types_error() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(result.is_none());
 }
@@ -159,6 +166,7 @@ fn top_level_function_conflicts_with_unqualified_import() {
         &module_exports,
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(result.is_none());
@@ -179,6 +187,7 @@ fn top_level_function_does_not_conflict_with_qualified_only_import() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(result.is_some());
 }
@@ -197,6 +206,7 @@ fn duplicate_module_use_without_unqualified_imports_is_allowed() {
         &module_exports,
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(result.is_some());
@@ -222,6 +232,7 @@ fn qualified_only_use_does_not_import_variant_constructors_unqualified() {
         &analysis.module_exports,
         resolved.module_aliases,
         &resolved.imported_type_decls,
+        &resolved.imported_field_indices,
         &resolved.imported_schemes,
     );
     assert!(
@@ -259,6 +270,7 @@ fn importing_type_name_brings_variant_constructors_into_scope() {
         &analysis.module_exports,
         resolved.module_aliases,
         &resolved.imported_type_decls,
+        &resolved.imported_field_indices,
         &resolved.imported_schemes,
     );
     assert!(
@@ -291,6 +303,7 @@ fn qualified_only_use_keeps_record_field_accessors_available() {
         &analysis.module_exports,
         resolved.module_aliases,
         &resolved.imported_type_decls,
+        &resolved.imported_field_indices,
         &resolved.imported_schemes,
     );
     assert!(
@@ -315,6 +328,7 @@ fn extern_signature_reports_unknown_type_without_type_import() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(report.has_errors());
@@ -346,6 +360,7 @@ fn extern_signature_accepts_type_imported_unqualified() {
         HashMap::new(),
         &imported_type_decls,
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(
         !report.has_errors(),
@@ -375,6 +390,7 @@ fn wildcard_import_enables_unqualified_call() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(result.is_some());
 }
@@ -395,6 +411,7 @@ fn local_shadowing_beats_unqualified_import() {
         &module_exports,
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(result.is_some());
@@ -543,6 +560,7 @@ fn imported_result_bind_reports_continuation_mismatch() {
         &module_exports,
         HashMap::new(),
         &imported_type_decls,
+        &HashMap::new(),
         &imported_schemes,
     );
 
@@ -648,6 +666,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
         &module_exports,
         HashMap::new(),
         &imported_type_decls,
+        &HashMap::new(),
         &imported_schemes,
     );
 
@@ -682,6 +701,7 @@ fn session_can_suppress_warning_emission() {
         HashMap::new(),
         &[],
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(result.output.is_some());
     assert_eq!(sess.emitted_warnings, 0);
@@ -703,6 +723,7 @@ fn session_still_emits_errors_when_warnings_disabled() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert!(result.output.is_none());
@@ -776,6 +797,7 @@ fn compile_emits_unused_local_binding_warning() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
     );
 

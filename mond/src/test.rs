@@ -3,13 +3,29 @@ use std::{collections::HashMap, path::Path, process::Command};
 use eyre::Context;
 
 use crate::{
-    TARGET_DIR, TEST_BUILD_DIR,
-    build::{ErlSources, generate_erl_sources_with_roots, reachable_std_modules},
+    TARGET_DIR, TEST_BUILD_DIR, TEST_DIR,
+    build::{ErlSources, generate_erl_sources_with_roots, reachable_dependency_modules},
     ui,
     utils::find_mond_files,
 };
 
-const TEST_DIR: &str = "tests";
+const ERL_SOURCE_SUBDIR: &str = "erl";
+const ERL_BEAM_SUBDIR: &str = "ebin";
+
+fn sanitize_erlang_component(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() || sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        sanitized.insert(0, '_');
+    }
+    sanitized
+}
 
 fn prepare_test_build_dir(build_dir: &Path) -> eyre::Result<()> {
     if build_dir.exists() {
@@ -22,6 +38,10 @@ fn prepare_test_build_dir(build_dir: &Path) -> eyre::Result<()> {
 pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let build_dir = project_dir.join(TARGET_DIR).join(TEST_BUILD_DIR);
     prepare_test_build_dir(&build_dir)?;
+    let erl_dir = build_dir.join(ERL_SOURCE_SUBDIR);
+    let ebin_dir = build_dir.join(ERL_BEAM_SUBDIR);
+    std::fs::create_dir_all(&erl_dir).context("could not create test erl dir")?;
+    std::fs::create_dir_all(&ebin_dir).context("could not create test ebin dir")?;
 
     let test_dir = project_dir.join(TEST_DIR);
     if !test_dir.exists() {
@@ -38,7 +58,11 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let src_dir = project_dir.join(crate::SOURCE_DIR);
     let src_module_names: std::collections::HashSet<String> = find_mond_files(&src_dir)
         .into_iter()
-        .filter_map(|path| path.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
         .collect();
 
     // Scan test files to collect their exports and sources
@@ -77,26 +101,27 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     // Compile src/ modules and get compilation state.
     let ErlSources {
         mut erl_paths,
+        manifest,
         module_exports,
         module_type_decls,
         all_module_schemes,
-        std_mods,
+        dependency_mods,
         module_aliases,
         ..
     } = generate_erl_sources_with_roots(
         project_dir,
-        &build_dir,
+        &erl_dir,
         &extra_src_roots.into_iter().collect::<Vec<_>>(),
     )?;
 
-    // Combined export map: std + src + test modules
+    // Combined export map: dependencies + src + test modules
     let mut all_exports = module_exports.clone();
-    let std_module_exports: HashMap<String, Vec<String>> = std_mods
+    let dependency_module_exports: HashMap<String, Vec<String>> = dependency_mods
         .iter()
         .map(|(u, _, src)| (u.clone(), mondc::exported_names(src)))
         .collect();
-    for (k, v) in &std_module_exports {
-        all_exports.insert(k.clone(), v.clone());
+    for (k, v) in &dependency_module_exports {
+        all_exports.entry(k.clone()).or_insert_with(|| v.clone());
     }
     for (k, v) in &test_module_exports {
         all_exports.insert(k.clone(), v.clone());
@@ -124,6 +149,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &all_exports,
             resolved.module_aliases,
             &resolved.imported_type_decls,
+            &resolved.imported_field_indices,
             &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(
@@ -133,7 +159,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         );
         match report.output {
             Some(erl_src) if !report.has_errors() => {
-                let erl_path = build_dir.join(format!("{module_name}.erl"));
+                let erl_path = erl_dir.join(format!("{module_name}.erl"));
                 if erl_path.exists() {
                     return Err(eyre::eyre!(
                         "Erlang module name collision: tests/{module_name}.mond would overwrite {}",
@@ -162,42 +188,50 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         ));
     }
 
-    // Compile std modules needed by test files (only those referenced via `use`)
-    let mut needed_std: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Compile dependency modules needed by test files (only those referenced via `use`)
+    let mut needed_dependencies: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for (_, source) in &test_module_sources {
         for (_, mod_name, _) in mondc::used_modules(source) {
-            if std_mods.iter().any(|(u, _, _)| u == &mod_name) {
-                needed_std.insert(mod_name);
+            if dependency_mods.iter().any(|(u, _, _)| u == &mod_name)
+                && !src_module_names.contains(&mod_name)
+            {
+                needed_dependencies.insert(mod_name);
             }
         }
     }
-    let selected_test_std_mods = reachable_std_modules(&std_mods, &needed_std)?;
+    let selected_test_dependency_mods =
+        reachable_dependency_modules(&dependency_mods, &needed_dependencies)?;
 
-    let std_analysis =
-        mondc::build_project_analysis(&std_mods, &[]).map_err(|err| eyre::eyre!(err))?;
-    for (user_name, erlang_name, source) in &selected_test_std_mods {
-        let erl_path = build_dir.join(format!("{erlang_name}.erl"));
+    let dependency_analysis =
+        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?;
+    for (user_name, erlang_name, source) in &selected_test_dependency_mods {
+        let erl_path = erl_dir.join(format!("{erlang_name}.erl"));
         if erl_path.exists() {
             if erl_paths.iter().any(|p| p == &erl_path) {
                 continue; // already compiled by generate_erl_sources
             }
             return Err(eyre::eyre!(
-                "Erlang module name collision: std module `{user_name}` would overwrite {}",
+                "Erlang module name collision: dependency module `{user_name}` would overwrite {}",
                 erl_path.display()
             ));
         }
 
-        let resolved =
-            mondc::resolve_imports_for_source(source, &std_module_exports, &std_analysis);
+        let resolved = mondc::resolve_imports_for_source(
+            source,
+            &dependency_module_exports,
+            &dependency_analysis,
+        );
 
         let report = mondc::compile_with_imports_report(
             erlang_name,
             source,
             &format!("{erlang_name}.mond"),
             resolved.imports,
-            &std_module_exports,
-            std_analysis.module_aliases.clone(),
+            &dependency_module_exports,
+            dependency_analysis.module_aliases.clone(),
             &resolved.imported_type_decls,
+            &resolved.imported_field_indices,
             &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(
@@ -230,8 +264,12 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     }
 
     // Generate the test runner Erlang module
-    let runner_erl = generate_runner(&test_fns_by_module);
-    let runner_path = build_dir.join("mond_test_runner.erl");
+    let runner_module = format!(
+        "i_{}_test_runner",
+        sanitize_erlang_component(&manifest.package.name)
+    );
+    let runner_erl = generate_runner(&runner_module, &test_fns_by_module);
+    let runner_path = erl_dir.join(format!("{runner_module}.erl"));
     if runner_path.exists() {
         return Err(eyre::eyre!(
             "Erlang module name collision: generated test runner would overwrite {}",
@@ -246,7 +284,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     // Compile all .erl files
     let erlc = Command::new("erlc")
         .arg("-o")
-        .arg(&build_dir)
+        .arg(&ebin_dir)
         .args(&erl_paths)
         .output()
         .context("could not run erlc")?;
@@ -266,9 +304,9 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let status = Command::new("erl")
         .arg("-noshell")
         .arg("-pz")
-        .arg(&build_dir)
+        .arg(&ebin_dir)
         .arg("-eval")
-        .arg("mond_test_runner:run().")
+        .arg(format!("{runner_module}:run()."))
         .status()
         .context("could not run erl")?;
 
@@ -284,7 +322,10 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-fn generate_runner(test_fns_by_module: &[(String, Vec<(String, String)>)]) -> String {
+fn generate_runner(
+    runner_module: &str,
+    test_fns_by_module: &[(String, Vec<(String, String)>)],
+) -> String {
     let mut tests_list = String::new();
     let mut first = true;
     for (module, fns) in test_fns_by_module {
@@ -298,7 +339,7 @@ fn generate_runner(test_fns_by_module: &[(String, Vec<(String, String)>)]) -> St
     }
 
     format!(
-        r#"-module(mond_test_runner).
+        r#"-module({runner_module}).
 -export([run/0]).
 
 run() ->

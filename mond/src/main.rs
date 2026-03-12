@@ -19,6 +19,7 @@ pub(crate) const TARGET_DIR: &str = "target";
 pub(crate) const DEBUG_BUILD_DIR: &str = "debug";
 pub(crate) const TEST_BUILD_DIR: &str = "tests";
 pub(crate) const SOURCE_DIR: &str = "src";
+pub(crate) const TEST_DIR: &str = "tests";
 pub(crate) const BIN_ENTRY_POINT: &str = "main.mond";
 pub(crate) const LIB_ROOT: &str = "lib.mond";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -101,7 +102,9 @@ fn main() -> eyre::Result<()> {
                     ui::success(&format!("updated {}", updated.join(", ")));
                 }
             } else {
-                ui::info("dependency cache is offline by default; run `mond deps --update` to refresh");
+                ui::info(
+                    "dependency cache is offline by default; run `mond deps --update` to refresh",
+                );
             }
         }
         Commands::Lsp => {

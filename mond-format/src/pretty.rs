@@ -196,16 +196,16 @@ fn fmt_let(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Doc
         // (let name {args} body...)  — function definition, 1 or more body exprs
         [name @ SExpr::Atom(_), args @ SExpr::Curly(..), bodies @ ..] if !bodies.is_empty() => {
             if bodies.len() == 1 {
-                // Single body: try inline first
-                group(concat_all([
+                // Function bodies always start on a new line.
+                concat_all([
                     text("("),
                     prefix,
                     fmt(name, source),
                     text(" "),
                     fmt(args, source),
-                    nest(2, concat(line(), fmt(&bodies[0], source))),
+                    nest(2, concat(hardline(), fmt(&bodies[0], source))),
                     text(")"),
-                ]))
+                ])
             } else {
                 // Multiple body exprs: always break, each on its own line
                 let body_docs: Vec<Doc> = bodies
@@ -229,18 +229,10 @@ fn fmt_let(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Doc
             let pairs = fmt_let_bindings(bindings, source);
             if bodies.is_empty() {
                 group(concat_all([text("("), prefix, pairs, text(")")]))
-            } else if bodies.len() == 1 {
-                group(concat_all([
-                    text("("),
-                    prefix,
-                    pairs,
-                    nest(2, concat(line(), fmt(&bodies[0], source))),
-                    text(")"),
-                ]))
             } else {
                 let body_docs: Vec<Doc> = bodies
                     .iter()
-                    .map(|b| concat(line(), fmt(b, source)))
+                    .map(|b| concat(hardline(), fmt(b, source)))
                     .collect();
                 concat_all([
                     text("("),

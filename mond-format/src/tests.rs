@@ -15,20 +15,23 @@ fn atom_passthrough() {
 
 #[test]
 fn let_func_inline() {
-    assert_eq!(fmt("(let add {a b} (+ a b))"), "(let add {a b} (+ a b))\n");
+    assert_eq!(
+        fmt("(let add {a b} (+ a b))"),
+        "(let add {a b}\n  (+ a b))\n"
+    );
 }
 
 #[test]
 fn let_func_pub() {
     assert_eq!(
         fmt("(pub let add {a b} (+ a b))"),
-        "(pub let add {a b} (+ a b))\n"
+        "(pub let add {a b}\n  (+ a b))\n"
     );
 }
 
 #[test]
 fn let_func_zero_args() {
-    assert_eq!(fmt("(let main {} 42)"), "(let main {} 42)\n");
+    assert_eq!(fmt("(let main {} 42)"), "(let main {}\n  42)\n");
 }
 
 #[test]
@@ -56,7 +59,10 @@ fn let_func_multi_body() {
 
 #[test]
 fn let_local_inline() {
-    assert_eq!(fmt("(let [x 1 y 2] (+ x y))"), "(let [x 1 y 2] (+ x y))\n");
+    assert_eq!(
+        fmt("(let [x 1 y 2] (+ x y))"),
+        "(let [x 1 y 2]\n  (+ x y))\n"
+    );
 }
 
 #[test]
@@ -188,7 +194,7 @@ fn consecutive_uses_no_blank_line() {
 fn use_then_let_gets_blank_line() {
     let src = "(use std/io)\n(let ident {x} x)";
     let out = fmt(src);
-    assert_eq!(out, "(use std/io)\n\n(let ident {x} x)\n");
+    assert_eq!(out, "(use std/io)\n\n(let ident {x}\n  x)\n");
 }
 
 // ── generic call ──────────────────────────────────────────────────────────
@@ -281,7 +287,7 @@ fn idempotent_type() {
 #[test]
 fn leading_comment_before_form() {
     let src = ";; docs for ident\n(let ident {x} x)";
-    assert_eq!(fmt(src), ";; docs for ident\n(let ident {x} x)\n");
+    assert_eq!(fmt(src), ";; docs for ident\n(let ident {x}\n  x)\n");
 }
 
 #[test]
@@ -289,7 +295,7 @@ fn comment_block_with_blank_line_preserved() {
     let src = ";; header\n\n;; docs for ident\n(let ident {x} x)";
     assert_eq!(
         fmt(src),
-        ";; header\n\n;; docs for ident\n(let ident {x} x)\n"
+        ";; header\n\n;; docs for ident\n(let ident {x}\n  x)\n"
     );
 }
 
@@ -298,7 +304,7 @@ fn comment_between_forms() {
     let src = "(let ident {x} x)\n\n;; docs for g\n(let g {x} x)";
     let out = fmt(src);
     assert!(
-        out.contains(";; docs for g\n(let g {x} x)"),
+        out.contains(";; docs for g\n(let g {x}\n  x)"),
         "comment should precede g:\n{out}"
     );
 }

@@ -1099,6 +1099,7 @@ impl Project {
             &visible_exports,
             imports.module_aliases.clone(),
             &imports.imported_type_decls,
+            &imports.imported_field_indices,
             &imports.imported_schemes,
         );
         let diagnostics = report
@@ -2804,6 +2805,7 @@ mod tests {
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
         let offset = src.find("add_one").unwrap();
@@ -2829,6 +2831,7 @@ mod tests {
             import_origins,
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
         let offset = src.find("assert_eq").unwrap();
@@ -2854,6 +2857,7 @@ mod tests {
             import_origins,
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
         let occurrences =
@@ -2979,6 +2983,7 @@ mod tests {
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
         let offset = src.rfind('2').unwrap();
@@ -2998,6 +3003,7 @@ mod tests {
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
         let offset = src.find("hello").unwrap();

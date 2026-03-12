@@ -14,6 +14,7 @@ pub struct ResolvedImports {
     pub import_origins: HashMap<String, String>,
     pub imported_schemes: crate::typecheck::TypeEnv,
     pub imported_type_decls: Vec<crate::ast::TypeDecl>,
+    pub imported_field_indices: HashMap<String, usize>,
     pub module_aliases: HashMap<String, String>,
 }
 
@@ -150,6 +151,7 @@ pub fn resolve_imports_for_source(
     let mut import_origins = HashMap::new();
     let mut imported_schemes = HashMap::new();
     let mut imported_type_decls = Vec::new();
+    let mut imported_field_indices: HashMap<String, usize> = HashMap::new();
     let mut imported_type_keys: HashSet<(String, String)> = HashSet::new();
 
     for (_, mod_name, unqualified) in crate::used_modules(source) {
@@ -186,6 +188,11 @@ pub fn resolve_imports_for_source(
                     for (name, scheme) in accessor_schemes {
                         if name.starts_with(':') {
                             imported_schemes.insert(name, scheme);
+                        }
+                    }
+                    if let crate::ast::TypeDecl::Record { fields, .. } = type_decl {
+                        for (i, (field_name, _)) in fields.iter().enumerate() {
+                            imported_field_indices.insert(field_name.clone(), i + 2);
                         }
                     }
                 }
@@ -229,6 +236,7 @@ pub fn resolve_imports_for_source(
         import_origins,
         imported_schemes,
         imported_type_decls,
+        imported_field_indices,
         module_aliases: project.module_aliases.clone(),
     }
 }

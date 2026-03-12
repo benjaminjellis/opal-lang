@@ -1,6 +1,6 @@
 use eyre::Context;
 
-use crate::{MANIFEST_NAME, SOURCE_DIR, utils::find_mond_files};
+use crate::{MANIFEST_NAME, SOURCE_DIR, TEST_DIR, utils::find_mond_files};
 use std::path::{Path, PathBuf};
 
 const LINE_WIDTH: usize = 80;
@@ -37,5 +37,8 @@ pub(crate) fn format_dir(dir: &Path) -> eyre::Result<()> {
 pub(crate) fn format_project_dir(project_dir: &Path) -> eyre::Result<()> {
     let src_dir = project_dir.join(SOURCE_DIR);
     format_dir(&src_dir)?;
+
+    let tests_dir = project_dir.join(TEST_DIR);
+    format_dir(&tests_dir)?;
     Ok(())
 }
