@@ -2697,6 +2697,11 @@ fn bind_pattern_locals(
             bind_pattern_locals(head, locals, out);
             bind_pattern_locals(tail, locals, out);
         }
+        mondc::ast::Pattern::Record { fields, .. } => {
+            for (_, pat, _) in fields {
+                bind_pattern_locals(pat, locals, out);
+            }
+        }
         mondc::ast::Pattern::Any(_)
         | mondc::ast::Pattern::Literal(_, _)
         | mondc::ast::Pattern::EmptyList(_) => {}
@@ -2721,6 +2726,11 @@ fn bind_pattern_names(pat: &mondc::ast::Pattern, out: &mut HashSet<String>) {
         mondc::ast::Pattern::Cons(head, tail, _) => {
             bind_pattern_names(head, out);
             bind_pattern_names(tail, out);
+        }
+        mondc::ast::Pattern::Record { fields, .. } => {
+            for (_, pat, _) in fields {
+                bind_pattern_names(pat, out);
+            }
         }
         mondc::ast::Pattern::Any(_)
         | mondc::ast::Pattern::Literal(_, _)

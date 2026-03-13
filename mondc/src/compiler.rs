@@ -280,9 +280,14 @@ pub fn compile_with_imports_in_session(
         diagnostics.push(diag.clone());
         sess.emit(&lowerer.files, &diag);
     }
+    for diag in warnings::redundant_match_diagnostics(&decls, file_id, imported_type_decls) {
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, &diag);
+    }
 
     let mut imported_constructors: HashMap<String, usize> = HashMap::new();
     let mut merged_imported_field_indices = imported_field_indices.clone();
+    let mut imported_record_layouts: HashMap<String, Vec<String>> = HashMap::new();
     for type_decl in imported_type_decls {
         match type_decl {
             ast::TypeDecl::Variant { constructors, .. } => {
@@ -291,10 +296,17 @@ pub fn compile_with_imports_in_session(
                         .insert(ctor_name.clone(), if payload.is_some() { 1 } else { 0 });
                 }
             }
-            ast::TypeDecl::Record { fields, .. } => {
+            ast::TypeDecl::Record { name, fields, .. } => {
                 for (i, (field_name, _)) in fields.iter().enumerate() {
                     merged_imported_field_indices.insert(field_name.clone(), i + 2);
                 }
+                imported_record_layouts.insert(
+                    name.clone(),
+                    fields
+                        .iter()
+                        .map(|(field_name, _)| field_name.clone())
+                        .collect(),
+                );
             }
         }
     }
@@ -306,6 +318,7 @@ pub fn compile_with_imports_in_session(
         module_aliases,
         imported_constructors,
         merged_imported_field_indices,
+        imported_record_layouts,
     );
     session::CompileReport {
         output: Some(codegen::emit_module(&module)),

@@ -586,6 +586,8 @@ pub struct TypeChecker {
     type_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
     /// Maps variant type name → constructor names for match exhaustiveness checks.
     variant_constructors: HashMap<String, Vec<String>>,
+    /// Maps record type name -> field names in declaration order.
+    record_fields: HashMap<String, Vec<String>>,
     /// Maps value/function name → (file_id, definition span) for error reporting.
     value_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
     /// Best-effort inferred types for expression spans, used by editor tooling.
@@ -598,6 +600,7 @@ impl TypeChecker {
             counter: 0,
             type_def_spans: HashMap::new(),
             variant_constructors: HashMap::new(),
+            record_fields: HashMap::new(),
             value_def_spans: HashMap::new(),
             expr_types: Vec::new(),
         }
@@ -629,7 +632,8 @@ impl TypeChecker {
             Pattern::Literal(_, _)
             | Pattern::Constructor(_, _, _)
             | Pattern::EmptyList(_)
-            | Pattern::Cons(_, _, _) => false,
+            | Pattern::Cons(_, _, _)
+            | Pattern::Record { .. } => false,
         }
     }
 
@@ -647,7 +651,8 @@ impl TypeChecker {
             | Pattern::Variable(_, _)
             | Pattern::Literal(_, _)
             | Pattern::EmptyList(_)
-            | Pattern::Cons(_, _, _) => {}
+            | Pattern::Cons(_, _, _)
+            | Pattern::Record { .. } => {}
         }
     }
 
@@ -659,7 +664,8 @@ impl TypeChecker {
             | Pattern::Variable(_, _)
             | Pattern::Literal(_, _)
             | Pattern::Constructor(_, _, _)
-            | Pattern::Cons(_, _, _) => false,
+            | Pattern::Cons(_, _, _)
+            | Pattern::Record { .. } => false,
         }
     }
 
@@ -671,7 +677,8 @@ impl TypeChecker {
             | Pattern::Variable(_, _)
             | Pattern::Literal(_, _)
             | Pattern::Constructor(_, _, _)
-            | Pattern::EmptyList(_) => false,
+            | Pattern::EmptyList(_)
+            | Pattern::Record { .. } => false,
         }
     }
 
@@ -686,7 +693,8 @@ impl TypeChecker {
             | Pattern::Literal(_, _)
             | Pattern::Constructor(_, _, _)
             | Pattern::EmptyList(_)
-            | Pattern::Cons(_, _, _) => false,
+            | Pattern::Cons(_, _, _)
+            | Pattern::Record { .. } => false,
         }
     }
 
@@ -1371,6 +1379,58 @@ impl TypeChecker {
                 Ok((s, tail_env))
             }
 
+            Pattern::Record { name, fields, span } => {
+                let declared_fields = self
+                    .record_fields
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
+                let scheme = env
+                    .get(name)
+                    .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
+                let mut record_ty = self.instantiate(scheme);
+                while let Type::Fun(_, ret) = record_ty.as_ref() {
+                    record_ty = ret.clone();
+                }
+
+                let mut subst = unify(expected, &record_ty)?;
+                let mut pat_env = env.clone();
+
+                for (field_name, field_pat, field_span) in fields {
+                    if !declared_fields
+                        .iter()
+                        .any(|declared| declared == field_name)
+                    {
+                        return Err(TypeError::UnknownField {
+                            field: field_name.clone(),
+                            record_ty: apply_subst(&subst, &record_ty),
+                            field_span: field_span.clone(),
+                            def: self.type_def_spans.get(name).cloned(),
+                        });
+                    }
+
+                    let accessor_name = format!(":{field_name}");
+                    let accessor_scheme = env.get(&accessor_name).ok_or_else(|| {
+                        TypeError::UnboundVariable(accessor_name, field_span.clone())
+                    })?;
+                    let accessor_ty = self.instantiate(accessor_scheme);
+                    let field_ty = self.fresh();
+                    let s_acc = unify(
+                        &apply_subst(&subst, &accessor_ty),
+                        &Type::fun(apply_subst(&subst, &record_ty), field_ty.clone()),
+                    )?;
+                    subst = compose_subst(&s_acc, &subst);
+
+                    let expected_field_ty = apply_subst(&subst, &field_ty);
+                    let (s_field, new_env) =
+                        self.infer_pattern(&pat_env, field_pat, &expected_field_ty)?;
+                    subst = compose_subst(&s_field, &subst);
+                    pat_env = new_env;
+                }
+
+                Ok((subst, pat_env))
+            }
+
             Pattern::Or(pats, _) => {
                 // Each alternative must type-check against the expected type.
                 // Apply accumulated substitution before each check so alternatives
@@ -1402,6 +1462,11 @@ impl TypeChecker {
             Pattern::Cons(head, tail, _) => {
                 self.record_pattern_binding_types(head, subst, env);
                 self.record_pattern_binding_types(tail, subst, env);
+            }
+            Pattern::Record { fields, .. } => {
+                for (_, pat, _) in fields {
+                    self.record_pattern_binding_types(pat, subst, env);
+                }
             }
             Pattern::Any(_) | Pattern::Literal(_, _) | Pattern::EmptyList(_) => {}
         }
@@ -1443,6 +1508,11 @@ impl TypeChecker {
                         self.variant_constructors.insert(
                             name.clone(),
                             constructors.iter().map(|(name, _)| name.clone()).collect(),
+                        );
+                    } else if let crate::ast::TypeDecl::Record { name, fields, .. } = type_decl {
+                        self.record_fields.insert(
+                            name.clone(),
+                            fields.iter().map(|(field, _)| field.clone()).collect(),
                         );
                     }
                     env.extend(constructor_schemes(type_decl));
@@ -2562,6 +2632,48 @@ mod tests {
         "#;
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_record_pattern_with_partial_destructuring() {
+        let src = r#"
+            (type Person ((:name ~ String) (:age ~ Int)))
+            (let age_of {person}
+              (match person
+                (Person :age age) ~> age))
+            (let main {} (age_of (Person "Ada" 37)))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_nested_record_pattern() {
+        let src = r#"
+            (type Address ((:city ~ String)))
+            (type Person ((:name ~ String) (:address ~ Address)))
+            (let city_of {person}
+              (match person
+                (Person :address (Address :city city)) ~> city))
+            (let main {} (city_of (Person "Ada" (Address "London"))))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::string());
+    }
+
+    #[test]
+    fn reject_unknown_field_in_record_pattern() {
+        let src = r#"
+            (type Person ((:name ~ String) (:age ~ Int)))
+            (let age_of {person}
+              (match person
+                (Person :height h) ~> h))
+        "#;
+        let err = check(src).expect_err("expected unknown field error");
+        match err {
+            TypeError::UnknownField { field, .. } => assert_eq!(field, "height"),
+            other => panic!("expected UnknownField, got {other:?}"),
+        }
     }
 
     #[test]

@@ -811,6 +811,76 @@ fn compile_emits_unused_local_binding_warning() {
 }
 
 #[test]
+fn redundant_match_analysis_flags_arm_after_catch_all() {
+    let src = "(let main {x} (match x _ ~> 0 True ~> 1))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "unreachable match arm");
+}
+
+#[test]
+fn redundant_match_analysis_flags_duplicate_or_alternative() {
+    let src = "(let main {x} (match x True or True ~> 1 False ~> 0))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "redundant match alternative");
+}
+
+#[test]
+fn redundant_match_analysis_flags_constructor_after_family_coverage() {
+    let src = "(type Light (Red Amber Green))\n(let main {light} (match light Red ~> 0 Amber ~> 1 Green ~> 2 Red ~> 3))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "unreachable match arm");
+}
+
+#[test]
+fn compile_report_emits_redundant_match_warning() {
+    let src = "(let main {x} (match x True ~> 1 False ~> 0 True ~> 2))";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    let messages: Vec<String> = report.diagnostics.into_iter().map(|d| d.message).collect();
+    assert!(
+        messages.iter().any(|m| m == "unreachable match arm"),
+        "missing redundant match warning in compile report: {messages:?}"
+    );
+}
+
+#[test]
 fn unqualified_import_warnings_skip_qualified_only_use() {
     let src = "(use std/io)\n(let main {} (io/println \"hello\"))";
     let mut lowerer = lower::Lowerer::new();

@@ -1787,15 +1787,53 @@ impl Lowerer {
             }
 
             SExpr::Round(items, span) => {
-                // Pattern like (Some x)
-                if let [SExpr::Atom(token), args @ ..] = items.as_slice()
+                if let [SExpr::Atom(token), rest @ ..] = items.as_slice()
                     && let TokenKind::Ident = token.kind
                 {
                     let name = self.source_at(file_id, token.span.clone()).to_string();
+                    let is_record_pattern = !rest.is_empty()
+                        && rest.iter().step_by(2).all(|item| {
+                            matches!(item, SExpr::Atom(t) if matches!(t.kind, TokenKind::NamedField(_)))
+                        });
 
-                    // Idiomatic recursive lowering of sub-patterns
+                    if is_record_pattern {
+                        if rest.len() % 2 != 0 {
+                            self.error(
+                                Diagnostic::error()
+                                    .with_code("E005")
+                                    .with_message("invalid record pattern")
+                                    .with_labels(vec![
+                                        Label::primary(file_id, span.clone())
+                                            .with_message("expected `:field pattern` pairs"),
+                                    ]),
+                            );
+                            return None;
+                        }
+
+                        let mut fields = Vec::new();
+                        let mut cursor = 0;
+                        while cursor < rest.len() {
+                            let (field_name, field_span) = match &rest[cursor] {
+                                SExpr::Atom(t) => match &t.kind {
+                                    TokenKind::NamedField(field) => (field.clone(), t.span.clone()),
+                                    _ => unreachable!("validated record field token"),
+                                },
+                                _ => unreachable!("validated record field token"),
+                            };
+                            let pat = self.lower_pattern(file_id, &rest[cursor + 1])?;
+                            fields.push((field_name, pat, field_span));
+                            cursor += 2;
+                        }
+
+                        return Some(Pattern::Record {
+                            name,
+                            fields,
+                            span: span.clone(),
+                        });
+                    }
+
                     let mut lowered_args = Vec::new();
-                    for arg in args {
+                    for arg in rest {
                         lowered_args.push(self.lower_pattern(file_id, arg)?);
                     }
 
@@ -2937,6 +2975,31 @@ mod tests {
             assert!(
                 matches!(&arms[1].0[0], Pattern::Constructor(name, args, _) if name == "Some" && args.len() == 1)
             );
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn test_record_pattern() {
+        let src = "(match person (Person :name name :age age) ~> age)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty());
+        if let Expr::Match { arms, .. } = expr {
+            match &arms[0].0[0] {
+                Pattern::Record { name, fields, .. } => {
+                    assert_eq!(name, "Person");
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].0, "name");
+                    assert!(matches!(fields[0].1, Pattern::Variable(ref s, _) if s == "name"));
+                    assert_eq!(fields[1].0, "age");
+                    assert!(matches!(fields[1].1, Pattern::Variable(ref s, _) if s == "age"));
+                }
+                other => panic!("expected record pattern, got {other:?}"),
+            }
         } else {
             panic!("expected Match");
         }

@@ -17,6 +17,8 @@ struct Ctx {
     module_aliases: HashMap<String, String>,
     /// Record field name → 1-based element index (tag is at 1, fields start at 2)
     field_indices: HashMap<String, usize>,
+    /// Record type name -> field names in declaration order
+    record_layouts: HashMap<String, Vec<String>>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -28,12 +30,14 @@ pub fn lower_module(
     module_aliases: HashMap<String, String>,
     imported_constructors: HashMap<String, usize>,
     imported_field_indices: HashMap<String, usize>,
+    imported_record_layouts: HashMap<String, Vec<String>>,
 ) -> ir::Module {
     // Pass 1: collect function names, arities, constructor arities, and record field indices
     let mut fn_names = HashSet::new();
     let mut fn_arities = HashMap::new();
     let mut constructors = imported_constructors;
     let mut field_indices = imported_field_indices;
+    let mut record_layouts = imported_record_layouts;
 
     for decl in decls {
         match decl {
@@ -52,11 +56,18 @@ pub fn lower_module(
                     constructors.insert(ctor_name.clone(), if payload.is_some() { 1 } else { 0 });
                 }
             }
-            ast::Declaration::Type(ast::TypeDecl::Record { fields, .. }) => {
+            ast::Declaration::Type(ast::TypeDecl::Record { name, fields, .. }) => {
                 // Tag is at element(1), fields start at element(2)
                 for (i, (field_name, _)) in fields.iter().enumerate() {
                     field_indices.insert(field_name.clone(), i + 2);
                 }
+                record_layouts.insert(
+                    name.clone(),
+                    fields
+                        .iter()
+                        .map(|(field_name, _)| field_name.clone())
+                        .collect(),
+                );
             }
             _ => {}
         }
@@ -69,6 +80,7 @@ pub fn lower_module(
         imports,
         module_aliases,
         field_indices,
+        record_layouts,
     };
 
     // Pass 2: lower declarations to IR functions
@@ -563,6 +575,25 @@ fn lower_pattern(pat: &ast::Pattern, ctx: &Ctx, renames: &HashMap<String, String
             Box::new(lower_pattern(tail, ctx, renames)),
         ),
 
+        ast::Pattern::Record { name, fields, .. } => {
+            let mut by_name = HashMap::new();
+            for (field_name, pat, _) in fields {
+                by_name.insert(field_name.as_str(), pat);
+            }
+
+            let mut items = vec![ir::Pattern::Atom(name.to_lowercase())];
+            if let Some(layout) = ctx.record_layouts.get(name) {
+                for field_name in layout {
+                    let pat = by_name
+                        .get(field_name.as_str())
+                        .map(|pat| lower_pattern(pat, ctx, renames))
+                        .unwrap_or(ir::Pattern::Any);
+                    items.push(pat);
+                }
+            }
+            ir::Pattern::Tuple(items)
+        }
+
         ast::Pattern::Or(pats, _) => {
             // Or-patterns are expanded by the caller via expand_or_pattern
             // If we get here directly, just use the first alternative
@@ -591,6 +622,11 @@ fn collect_pattern_vars(pat: &ast::Pattern, out: &mut Vec<String>) {
         ast::Pattern::Cons(head, tail, _) => {
             collect_pattern_vars(head, out);
             collect_pattern_vars(tail, out);
+        }
+        ast::Pattern::Record { fields, .. } => {
+            for (_, pat, _) in fields {
+                collect_pattern_vars(pat, out);
+            }
         }
         ast::Pattern::Any(_) | ast::Pattern::Literal(_, _) | ast::Pattern::EmptyList(_) => {}
     }

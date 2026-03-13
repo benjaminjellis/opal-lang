@@ -3,6 +3,124 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::ast;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MatchFamily {
+    Bool,
+    List,
+    Variant(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MatchMember {
+    Bool(bool),
+    EmptyList,
+    NonEmptyList,
+    Constructor(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PatternKey {
+    Literal(LiteralPatternKey),
+    EmptyList,
+    NonEmptyList,
+    Constructor(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LiteralPatternKey {
+    Int(i64),
+    Bool(bool),
+    Float(u64),
+    String(String),
+    Unit,
+}
+
+#[derive(Debug, Clone)]
+struct PatternSummary {
+    span: std::ops::Range<usize>,
+    key: Option<PatternKey>,
+    family_member: Option<(MatchFamily, MatchMember)>,
+    is_catch_all: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CoveredFamily {
+    members: HashSet<MatchMember>,
+    complete_span: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MatchCoverage {
+    catch_all_span: Option<std::ops::Range<usize>>,
+    exact: HashMap<PatternKey, std::ops::Range<usize>>,
+    families: HashMap<MatchFamily, CoveredFamily>,
+}
+
+impl MatchCoverage {
+    fn coverage_source(&self, summary: &PatternSummary) -> Option<&std::ops::Range<usize>> {
+        if let Some(span) = self.catch_all_span.as_ref() {
+            return Some(span);
+        }
+        if let Some(key) = summary.key.as_ref()
+            && let Some(span) = self.exact.get(key)
+        {
+            return Some(span);
+        }
+        if let Some((family, member)) = summary.family_member.as_ref()
+            && let Some(covered) = self.families.get(family)
+        {
+            if covered.members.contains(member) {
+                return self.exact.get(summary.key.as_ref()?);
+            }
+            if let Some(span) = covered.complete_span.as_ref() {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    fn record(
+        &mut self,
+        summary: &PatternSummary,
+        variant_families: &HashMap<String, Vec<String>>,
+    ) {
+        if summary.is_catch_all {
+            self.catch_all_span = Some(summary.span.clone());
+            return;
+        }
+        if let Some(key) = summary.key.as_ref() {
+            self.exact
+                .entry(key.clone())
+                .or_insert_with(|| summary.span.clone());
+        }
+        if let Some((family, member)) = summary.family_member.as_ref() {
+            let covered = self
+                .families
+                .entry(family.clone())
+                .or_insert_with(|| CoveredFamily {
+                    members: HashSet::new(),
+                    complete_span: None,
+                });
+            covered.members.insert(member.clone());
+            if covered.complete_span.is_none()
+                && family_is_complete(family, &covered.members, variant_families)
+            {
+                covered.complete_span = Some(summary.span.clone());
+            }
+        }
+    }
+}
+
+fn literal_pattern_key(lit: &ast::Literal) -> LiteralPatternKey {
+    match lit {
+        ast::Literal::Int(value) => LiteralPatternKey::Int(*value),
+        ast::Literal::Bool(value) => LiteralPatternKey::Bool(*value),
+        ast::Literal::Float(value) => LiteralPatternKey::Float(value.to_bits()),
+        ast::Literal::String(value) => LiteralPatternKey::String(value.clone()),
+        ast::Literal::Unit => LiteralPatternKey::Unit,
+    }
+}
+
 fn imported_names_for_use_decl(
     mod_name: &str,
     unqualified: &ast::UnqualifiedImports,
@@ -36,7 +154,382 @@ fn bind_pattern_names(pat: &ast::Pattern, out: &mut HashSet<String>) {
             bind_pattern_names(head, out);
             bind_pattern_names(tail, out);
         }
+        ast::Pattern::Record { fields, .. } => {
+            for (_, pat, _) in fields {
+                bind_pattern_names(pat, out);
+            }
+        }
         ast::Pattern::Any(_) | ast::Pattern::Literal(_, _) | ast::Pattern::EmptyList(_) => {}
+    }
+}
+
+fn pattern_span(pat: &ast::Pattern) -> std::ops::Range<usize> {
+    match pat {
+        ast::Pattern::Any(span)
+        | ast::Pattern::Variable(_, span)
+        | ast::Pattern::Literal(_, span)
+        | ast::Pattern::Constructor(_, _, span)
+        | ast::Pattern::Or(_, span)
+        | ast::Pattern::EmptyList(span)
+        | ast::Pattern::Cons(_, _, span) => span.clone(),
+        ast::Pattern::Record { span, .. } => span.clone(),
+    }
+}
+
+fn flatten_top_level_alternatives(pat: &ast::Pattern) -> Vec<&ast::Pattern> {
+    match pat {
+        ast::Pattern::Or(pats, _) => pats.iter().collect(),
+        _ => vec![pat],
+    }
+}
+
+fn pattern_summary(
+    pat: &ast::Pattern,
+    constructor_families: &HashMap<String, String>,
+) -> PatternSummary {
+    match pat {
+        ast::Pattern::Any(span) | ast::Pattern::Variable(_, span) => PatternSummary {
+            span: span.clone(),
+            key: None,
+            family_member: None,
+            is_catch_all: true,
+        },
+        ast::Pattern::Literal(lit, span) => {
+            let family_member = match lit {
+                ast::Literal::Bool(value) => Some((MatchFamily::Bool, MatchMember::Bool(*value))),
+                _ => None,
+            };
+            PatternSummary {
+                span: span.clone(),
+                key: Some(PatternKey::Literal(literal_pattern_key(lit))),
+                family_member,
+                is_catch_all: false,
+            }
+        }
+        ast::Pattern::Constructor(name, _, span) => PatternSummary {
+            span: span.clone(),
+            key: Some(PatternKey::Constructor(name.clone())),
+            family_member: constructor_families.get(name).map(|type_name| {
+                (
+                    MatchFamily::Variant(type_name.clone()),
+                    MatchMember::Constructor(name.clone()),
+                )
+            }),
+            is_catch_all: false,
+        },
+        ast::Pattern::EmptyList(span) => PatternSummary {
+            span: span.clone(),
+            key: Some(PatternKey::EmptyList),
+            family_member: Some((MatchFamily::List, MatchMember::EmptyList)),
+            is_catch_all: false,
+        },
+        ast::Pattern::Cons(_, _, span) => PatternSummary {
+            span: span.clone(),
+            key: Some(PatternKey::NonEmptyList),
+            family_member: Some((MatchFamily::List, MatchMember::NonEmptyList)),
+            is_catch_all: false,
+        },
+        ast::Pattern::Record { span, .. } => PatternSummary {
+            span: span.clone(),
+            key: None,
+            family_member: None,
+            is_catch_all: false,
+        },
+        ast::Pattern::Or(_, span) => PatternSummary {
+            span: span.clone(),
+            key: None,
+            family_member: None,
+            is_catch_all: false,
+        },
+    }
+}
+
+fn family_is_complete(
+    family: &MatchFamily,
+    members: &HashSet<MatchMember>,
+    variant_families: &HashMap<String, Vec<String>>,
+) -> bool {
+    match family {
+        MatchFamily::Bool => {
+            members.contains(&MatchMember::Bool(true))
+                && members.contains(&MatchMember::Bool(false))
+        }
+        MatchFamily::List => {
+            members.contains(&MatchMember::EmptyList)
+                && members.contains(&MatchMember::NonEmptyList)
+        }
+        MatchFamily::Variant(type_name) => {
+            variant_families.get(type_name).is_some_and(|constructors| {
+                constructors
+                    .iter()
+                    .all(|name| members.contains(&MatchMember::Constructor(name.clone())))
+            })
+        }
+    }
+}
+
+fn constructor_family_map(
+    decls: &[ast::Declaration],
+    imported_type_decls: &[ast::TypeDecl],
+) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
+    let mut constructor_families = HashMap::new();
+    let mut variant_families = HashMap::new();
+
+    for type_decl in imported_type_decls
+        .iter()
+        .chain(decls.iter().filter_map(|decl| match decl {
+            ast::Declaration::Type(type_decl) => Some(type_decl),
+            _ => None,
+        }))
+    {
+        if let ast::TypeDecl::Variant {
+            name, constructors, ..
+        } = type_decl
+        {
+            let constructor_names: Vec<String> = constructors
+                .iter()
+                .map(|(ctor_name, _)| ctor_name.clone())
+                .collect();
+            for constructor_name in &constructor_names {
+                constructor_families.insert(constructor_name.clone(), name.clone());
+            }
+            variant_families.insert(name.clone(), constructor_names);
+        }
+    }
+
+    (constructor_families, variant_families)
+}
+
+fn unreachable_match_arm_diagnostic(
+    file_id: usize,
+    arm_span: std::ops::Range<usize>,
+    covered_by: std::ops::Range<usize>,
+) -> Diagnostic<usize> {
+    Diagnostic::warning()
+        .with_message("unreachable match arm")
+        .with_labels(vec![
+            Label::primary(file_id, arm_span).with_message("this arm can never match"),
+            Label::secondary(file_id, covered_by)
+                .with_message("an earlier arm already covers every value matched here"),
+        ])
+}
+
+fn redundant_match_alternative_diagnostic(
+    file_id: usize,
+    alternative_span: std::ops::Range<usize>,
+    covered_by: std::ops::Range<usize>,
+) -> Diagnostic<usize> {
+    Diagnostic::warning()
+        .with_message("redundant match alternative")
+        .with_labels(vec![
+            Label::primary(file_id, alternative_span)
+                .with_message("this alternative is already covered"),
+            Label::secondary(file_id, covered_by).with_message("covered earlier here"),
+        ])
+}
+
+fn collect_match_redundancy_diagnostics_expr(
+    expr: &ast::Expr,
+    file_id: usize,
+    constructor_families: &HashMap<String, String>,
+    variant_families: &HashMap<String, Vec<String>>,
+    out: &mut Vec<Diagnostic<usize>>,
+) {
+    use ast::Expr;
+
+    match expr {
+        Expr::Literal(_, _) | Expr::Variable(_, _) => {}
+        Expr::List(items, _) => {
+            for item in items {
+                collect_match_redundancy_diagnostics_expr(
+                    item,
+                    file_id,
+                    constructor_families,
+                    variant_families,
+                    out,
+                );
+            }
+        }
+        Expr::LetFunc { value, .. } => collect_match_redundancy_diagnostics_expr(
+            value,
+            file_id,
+            constructor_families,
+            variant_families,
+            out,
+        ),
+        Expr::LetLocal { value, body, .. } => {
+            collect_match_redundancy_diagnostics_expr(
+                value,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+            collect_match_redundancy_diagnostics_expr(
+                body,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+        }
+        Expr::If {
+            cond, then, els, ..
+        } => {
+            collect_match_redundancy_diagnostics_expr(
+                cond,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+            collect_match_redundancy_diagnostics_expr(
+                then,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+            collect_match_redundancy_diagnostics_expr(
+                els,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+        }
+        Expr::Call { func, args, .. } => {
+            collect_match_redundancy_diagnostics_expr(
+                func,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+            for arg in args {
+                collect_match_redundancy_diagnostics_expr(
+                    arg,
+                    file_id,
+                    constructor_families,
+                    variant_families,
+                    out,
+                );
+            }
+        }
+        Expr::Match { targets, arms, .. } => {
+            for target in targets {
+                collect_match_redundancy_diagnostics_expr(
+                    target,
+                    file_id,
+                    constructor_families,
+                    variant_families,
+                    out,
+                );
+            }
+
+            if targets.len() == 1 {
+                let mut coverage = MatchCoverage::default();
+                for (patterns, body) in arms {
+                    let Some(pattern) = patterns.first() else {
+                        collect_match_redundancy_diagnostics_expr(
+                            body,
+                            file_id,
+                            constructor_families,
+                            variant_families,
+                            out,
+                        );
+                        continue;
+                    };
+
+                    let mut arm_coverage = coverage.clone();
+                    let mut has_reachable_alternative = false;
+                    let mut arm_diags = Vec::new();
+                    for alternative in flatten_top_level_alternatives(pattern) {
+                        let summary = pattern_summary(alternative, constructor_families);
+                        if let Some(covered_by) = arm_coverage.coverage_source(&summary).cloned() {
+                            arm_diags.push(redundant_match_alternative_diagnostic(
+                                file_id,
+                                summary.span.clone(),
+                                covered_by,
+                            ));
+                            continue;
+                        }
+                        has_reachable_alternative = true;
+                        arm_coverage.record(&summary, variant_families);
+                    }
+
+                    if !has_reachable_alternative {
+                        let covered_by = coverage
+                            .catch_all_span
+                            .clone()
+                            .or_else(|| arm_coverage.catch_all_span.clone())
+                            .unwrap_or_else(|| pattern_span(pattern));
+                        out.push(unreachable_match_arm_diagnostic(
+                            file_id,
+                            pattern_span(pattern),
+                            covered_by,
+                        ));
+                    } else {
+                        out.extend(arm_diags);
+                        coverage = arm_coverage;
+                    }
+
+                    collect_match_redundancy_diagnostics_expr(
+                        body,
+                        file_id,
+                        constructor_families,
+                        variant_families,
+                        out,
+                    );
+                }
+            } else {
+                for (_, body) in arms {
+                    collect_match_redundancy_diagnostics_expr(
+                        body,
+                        file_id,
+                        constructor_families,
+                        variant_families,
+                        out,
+                    );
+                }
+            }
+        }
+        Expr::FieldAccess { record, .. } => collect_match_redundancy_diagnostics_expr(
+            record,
+            file_id,
+            constructor_families,
+            variant_families,
+            out,
+        ),
+        Expr::RecordConstruct { fields, .. } => {
+            for (_, value) in fields {
+                collect_match_redundancy_diagnostics_expr(
+                    value,
+                    file_id,
+                    constructor_families,
+                    variant_families,
+                    out,
+                );
+            }
+        }
+        Expr::Lambda { body, .. } => collect_match_redundancy_diagnostics_expr(
+            body,
+            file_id,
+            constructor_families,
+            variant_families,
+            out,
+        ),
+        Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_match_redundancy_diagnostics_expr(
+                    arg,
+                    file_id,
+                    constructor_families,
+                    variant_families,
+                    out,
+                );
+            }
+        }
     }
 }
 
@@ -473,6 +966,11 @@ fn collect_pattern_constructor_names(pat: &ast::Pattern, out: &mut HashSet<Strin
         ast::Pattern::Cons(head, tail, _) => {
             collect_pattern_constructor_names(head, out);
             collect_pattern_constructor_names(tail, out);
+        }
+        ast::Pattern::Record { fields, .. } => {
+            for (_, pat, _) in fields {
+                collect_pattern_constructor_names(pat, out);
+            }
         }
         ast::Pattern::Any(_)
         | ast::Pattern::Variable(_, _)
@@ -1012,4 +1510,39 @@ pub(crate) fn unused_unqualified_import_diagnostics(
     }
 
     diags
+}
+
+pub(crate) fn redundant_match_diagnostics(
+    decls: &[ast::Declaration],
+    file_id: usize,
+    imported_type_decls: &[ast::TypeDecl],
+) -> Vec<Diagnostic<usize>> {
+    let (constructor_families, variant_families) =
+        constructor_family_map(decls, imported_type_decls);
+    let mut diagnostics = Vec::new();
+
+    for decl in decls {
+        match decl {
+            ast::Declaration::Expression(expr) => collect_match_redundancy_diagnostics_expr(
+                expr,
+                file_id,
+                &constructor_families,
+                &variant_families,
+                &mut diagnostics,
+            ),
+            ast::Declaration::Test { body, .. } => collect_match_redundancy_diagnostics_expr(
+                body,
+                file_id,
+                &constructor_families,
+                &variant_families,
+                &mut diagnostics,
+            ),
+            ast::Declaration::Type(_)
+            | ast::Declaration::ExternLet { .. }
+            | ast::Declaration::ExternType { .. }
+            | ast::Declaration::Use { .. } => {}
+        }
+    }
+
+    diagnostics
 }

@@ -176,6 +176,12 @@ pub enum Pattern {
     EmptyList(Range<usize>),
     /// Matches a cons cell: `[head | tail]`
     Cons(Box<Pattern>, Box<Pattern>, Range<usize>),
+    /// Matches a record by named fields: `(Person :name n :age age)`
+    Record {
+        name: String,
+        fields: Vec<(String, Pattern, Range<usize>)>,
+        span: Range<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
