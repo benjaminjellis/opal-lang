@@ -843,6 +843,45 @@ fn redundant_match_analysis_flags_duplicate_or_alternative() {
 }
 
 #[test]
+fn redundant_match_analysis_does_not_flag_nested_constructor_as_full_coverage() {
+    let src =
+        "(let main {result} (match result (Ok (Some x)) ~> 1 (Ok None) ~> 2 (Error err) ~> 3))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected redundancy warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn redundant_match_analysis_flags_duplicate_constructor_with_wildcard_payload() {
+    let src = "(let main {result} (match result (Ok x) ~> 1 (Ok y) ~> 2 (Error err) ~> 3))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "unreachable match arm");
+}
+
+#[test]
 fn redundant_match_analysis_flags_constructor_after_family_coverage() {
     let src = "(type Light (Red Amber Green))\n(let main {light} (match light Red ~> 0 Amber ~> 1 Green ~> 2 Red ~> 3))";
     let mut lowerer = lower::Lowerer::new();
