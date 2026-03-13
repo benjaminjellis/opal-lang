@@ -530,7 +530,7 @@ pub(crate) fn load_dependencies(
     for package in packages {
         let dep_name = &package.name;
         let checkout_dir = &package.checkout_dir;
-        let dep_loaded = load_dependency_from_checkout(&dep_name, &checkout_dir)?;
+        let dep_loaded = load_dependency_from_checkout(dep_name, checkout_dir)?;
         for (module_name, _, _) in &dep_loaded.modules {
             if let Some(existing_dep) = module_owner.insert(module_name.clone(), dep_name.clone())
                 && existing_dep != *dep_name
