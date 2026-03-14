@@ -895,14 +895,28 @@ fn used_qualified_modules(decls: &[ast::Declaration]) -> HashSet<String> {
 
 fn collect_type_usage_names(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
     match ty {
-        ast::TypeUsage::Named(name) => {
+        ast::TypeUsage::Named(name, _) => {
             out.insert(name.clone());
         }
-        ast::TypeUsage::Generic(_) => {}
-        ast::TypeUsage::App(head, args) => {
+        ast::TypeUsage::Generic(_, _) => {}
+        ast::TypeUsage::App(head, args, _) => {
             out.insert(head.clone());
             for arg in args {
                 collect_type_usage_names(arg, out);
+            }
+        }
+    }
+}
+
+fn collect_type_usage_generics(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
+    match ty {
+        ast::TypeUsage::Named(_, _) => {}
+        ast::TypeUsage::Generic(name, _) => {
+            out.insert(name.clone());
+        }
+        ast::TypeUsage::App(_, args, _) => {
+            for arg in args {
+                collect_type_usage_generics(arg, out);
             }
         }
     }
@@ -923,6 +937,63 @@ fn collect_decl_type_usage_names(decl: &ast::TypeDecl, out: &mut HashSet<String>
             }
         }
     }
+}
+
+pub(crate) fn unused_type_param_spans(
+    decls: &[ast::Declaration],
+) -> Vec<(String, String, std::ops::Range<usize>)> {
+    let mut unused = Vec::new();
+
+    for decl in decls {
+        let (type_name, params, span, usages): (
+            &str,
+            &[String],
+            &std::ops::Range<usize>,
+            Vec<&ast::TypeUsage>,
+        ) = match decl {
+            ast::Declaration::Type(ast::TypeDecl::Record {
+                name,
+                params,
+                fields,
+                span,
+                ..
+            }) => (
+                name,
+                params,
+                span,
+                fields.iter().map(|(_, ty)| ty).collect(),
+            ),
+            ast::Declaration::Type(ast::TypeDecl::Variant {
+                name,
+                params,
+                constructors,
+                span,
+                ..
+            }) => (
+                name,
+                params,
+                span,
+                constructors
+                    .iter()
+                    .filter_map(|(_, payload)| payload.as_ref())
+                    .collect(),
+            ),
+            _ => continue,
+        };
+
+        let mut used_generics = HashSet::new();
+        for usage in usages {
+            collect_type_usage_generics(usage, &mut used_generics);
+        }
+
+        for param in params {
+            if !used_generics.contains(param) {
+                unused.push((type_name.to_string(), param.clone(), span.clone()));
+            }
+        }
+    }
+
+    unused
 }
 
 fn collect_type_sig_usage_names(sig: &ast::TypeSig, out: &mut HashSet<String>) {

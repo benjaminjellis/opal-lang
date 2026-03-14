@@ -23,9 +23,93 @@ fn collect_type_sig_names(sig: &ast::TypeSig, out: &mut HashSet<String>) {
     }
 }
 
+fn collect_type_usage_names(usage: &ast::TypeUsage, out: &mut HashSet<String>) {
+    match usage {
+        ast::TypeUsage::Named(name, _) => {
+            out.insert(name.clone());
+        }
+        ast::TypeUsage::Generic(_, _) => {}
+        ast::TypeUsage::App(head, args, _) => {
+            out.insert(head.clone());
+            for arg in args {
+                collect_type_usage_names(arg, out);
+            }
+        }
+    }
+}
+
+fn known_type_arities(
+    decls: &[ast::Declaration],
+    imported_type_decls: &[ast::TypeDecl],
+) -> HashMap<String, usize> {
+    let mut arities = HashMap::new();
+    for name in PRIMITIVE_TYPE_NAMES {
+        let arity = if name == "List" { 1 } else { 0 };
+        arities.insert(name.to_string(), arity);
+    }
+    for type_decl in imported_type_decls {
+        match type_decl {
+            ast::TypeDecl::Record { name, params, .. } => {
+                arities.insert(name.clone(), params.len());
+            }
+            ast::TypeDecl::Variant { name, params, .. } => {
+                arities.insert(name.clone(), params.len());
+            }
+        }
+    }
+    for decl in decls {
+        match decl {
+            ast::Declaration::Type(ast::TypeDecl::Record { name, params, .. }) => {
+                arities.insert(name.clone(), params.len());
+            }
+            ast::Declaration::Type(ast::TypeDecl::Variant { name, params, .. }) => {
+                arities.insert(name.clone(), params.len());
+            }
+            ast::Declaration::ExternType { name, params, .. } => {
+                arities.insert(name.clone(), params.len());
+            }
+            _ => {}
+        }
+    }
+    arities
+}
+
+fn collect_type_usage_arity_errors(
+    usage: &ast::TypeUsage,
+    known_arities: &HashMap<String, usize>,
+    generic_params: &HashSet<String>,
+    out: &mut Vec<(String, usize, usize, std::ops::Range<usize>)>,
+) {
+    match usage {
+        ast::TypeUsage::Generic(_, _) => {}
+        ast::TypeUsage::Named(name, span) => {
+            if generic_params.contains(name) {
+                return;
+            }
+            if let Some(expected) = known_arities.get(name)
+                && *expected > 0
+            {
+                out.push((name.clone(), *expected, 0, span.clone()));
+            }
+        }
+        ast::TypeUsage::App(head, args, span) => {
+            if !generic_params.contains(head)
+                && let Some(expected) = known_arities.get(head)
+                && *expected != args.len()
+            {
+                out.push((head.clone(), *expected, args.len(), span.clone()));
+            }
+            for arg in args {
+                collect_type_usage_arity_errors(arg, known_arities, generic_params, out);
+            }
+        }
+    }
+}
+
 fn known_type_names(
     decls: &[ast::Declaration],
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
 ) -> HashSet<String> {
     let mut known: HashSet<String> = PRIMITIVE_TYPE_NAMES
         .iter()
@@ -41,6 +125,7 @@ fn known_type_names(
             }
         }
     }
+    known.extend(imported_extern_types.iter().cloned());
     for decl in decls {
         match decl {
             ast::Declaration::Type(ast::TypeDecl::Record { name, .. }) => {
@@ -69,6 +154,7 @@ pub(crate) fn compile(module_name: &str, source: &str) -> Option<String> {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     )
@@ -84,6 +170,7 @@ pub fn compile_with_imports_in_session(
     module_exports: &HashMap<String, Vec<String>>,
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
     imported_field_indices: &HashMap<String, usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
@@ -176,7 +263,104 @@ pub fn compile_with_imports_in_session(
         };
     }
 
-    let known_types = known_type_names(&decls, imported_type_decls);
+    let known_types = known_type_names(&decls, imported_type_decls, imported_extern_types);
+    let known_type_arities = known_type_arities(&decls, imported_type_decls);
+    let mut type_decl_errors = false;
+    for decl in &decls {
+        let (name, params, usages, span) = match decl {
+            ast::Declaration::Type(ast::TypeDecl::Record {
+                name,
+                params,
+                fields,
+                span,
+                ..
+            }) => (
+                name.as_str(),
+                params.as_slice(),
+                fields.iter().map(|(_, usage)| usage).collect::<Vec<_>>(),
+                span.clone(),
+            ),
+            ast::Declaration::Type(ast::TypeDecl::Variant {
+                name,
+                params,
+                constructors,
+                span,
+                ..
+            }) => (
+                name.as_str(),
+                params.as_slice(),
+                constructors
+                    .iter()
+                    .filter_map(|(_, usage)| usage.as_ref())
+                    .collect::<Vec<_>>(),
+                span.clone(),
+            ),
+            _ => continue,
+        };
+
+        let generic_params = params.iter().cloned().collect::<HashSet<_>>();
+        let mut referenced_types = HashSet::new();
+        for usage in &usages {
+            collect_type_usage_names(usage, &mut referenced_types);
+        }
+        let mut unknown: Vec<String> = referenced_types
+            .into_iter()
+            .filter(|type_name| {
+                !known_types.contains(type_name) && !generic_params.contains(type_name)
+            })
+            .collect();
+        unknown.sort();
+        if unknown.is_empty() {
+        } else {
+            let plural = if unknown.len() == 1 { "" } else { "s" };
+            let diag = codespan_reporting::diagnostic::Diagnostic::error()
+                .with_message(format!(
+                    "unknown type{plural} in type declaration `{name}`: {}",
+                    unknown.join(", ")
+                ))
+                .with_labels(vec![
+                    codespan_reporting::diagnostic::Label::primary(file_id, span.clone()).with_message(
+                        "declare these types in this module or import them unqualified before using them here",
+                    ),
+                ]);
+            diagnostics.push(diag.clone());
+            sess.emit(&lowerer.files, &diag);
+            type_decl_errors = true;
+        }
+
+        let mut arity_errors = Vec::new();
+        for usage in &usages {
+            collect_type_usage_arity_errors(
+                usage,
+                &known_type_arities,
+                &generic_params,
+                &mut arity_errors,
+            );
+        }
+        arity_errors.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        arity_errors.dedup();
+        for (type_name, expected, found, usage_span) in arity_errors {
+            let diag = codespan_reporting::diagnostic::Diagnostic::error()
+                .with_message(format!(
+                    "wrong number of type arguments for `{type_name}` in type declaration `{name}`: expected {expected}, found {found}"
+                ))
+                .with_labels(vec![
+                    codespan_reporting::diagnostic::Label::primary(file_id, usage_span)
+                        .with_message("use the required number of type arguments here"),
+                ]);
+            diagnostics.push(diag.clone());
+            sess.emit(&lowerer.files, &diag);
+            type_decl_errors = true;
+        }
+    }
+    if type_decl_errors {
+        return session::CompileReport {
+            output: None,
+            files: lowerer.files,
+            diagnostics,
+        };
+    }
+
     let mut extern_type_errors = false;
     for decl in &decls {
         let ast::Declaration::ExternLet { name, ty, span, .. } = decl else {
@@ -261,6 +445,18 @@ pub fn compile_with_imports_in_session(
         diagnostics.push(diag.clone());
         sess.emit(&lowerer.files, &diag);
     }
+    for (type_name, param, span) in warnings::unused_type_param_spans(&decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!(
+                "unused type parameter `{param}` in type `{type_name}`"
+            ))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this type parameter is never used in the type definition"),
+            ]);
+        diagnostics.push(diag.clone());
+        sess.emit(&lowerer.files, &diag);
+    }
     for (name, span) in warnings::unused_local_spans(&decls) {
         let diag = codespan_reporting::diagnostic::Diagnostic::warning()
             .with_message(format!("unused local binding `{name}`"))
@@ -336,6 +532,7 @@ pub fn compile_with_imports_report(
     module_exports: &HashMap<String, Vec<String>>,
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
     imported_field_indices: &HashMap<String, usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
@@ -349,6 +546,7 @@ pub fn compile_with_imports_report(
         module_exports,
         module_aliases,
         imported_type_decls,
+        imported_extern_types,
         imported_field_indices,
         imported_schemes,
     )
@@ -363,6 +561,7 @@ pub fn compile_with_imports(
     module_exports: &HashMap<String, Vec<String>>,
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
     imported_field_indices: &HashMap<String, usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> Option<String> {
@@ -374,6 +573,7 @@ pub fn compile_with_imports(
         module_exports,
         module_aliases,
         imported_type_decls,
+        imported_extern_types,
         imported_field_indices,
         imported_schemes,
     );

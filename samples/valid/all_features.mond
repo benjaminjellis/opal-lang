@@ -8,30 +8,47 @@
 
 ;; extern declarations (`extern let`, nullary extern let, and extern type)
 (pub extern let println ~ (String -> Unit) io/format)
-(extern let system_time {} ~ Int erlang/system_time)
+(extern let system_time ~ (Unit -> Int) erlang/system_time)
 (pub extern type ['k 'v] Dict maps/map)
 
 ;; type declarations: generic variant and generic record
-(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
+(pub type ['a 'e] Result [
+  (Ok ~ 'a)
+  (Error ~ 'e)])
 
-(pub type ['a] Box [(:value ~ 'a) (:label ~ String)])
+(pub type ['a] Box [
+  (:value ~ 'a)
+  (:label ~ String)])
 
 ;; top-level function (`let`) with recursion + `if`
-(let factorial {n} (if (= n 0) 1 (* n (factorial (- n 1)))))
+(let factorial {n}
+  (if (= n 0) 1 (* n (factorial (- n 1)))))
 
 ;; needed for `let?`
-(pub let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
+(pub let bind {m func}
+  (match m
+    (Ok x) ~> (func x)
+    (Error e) ~> (Error e)))
 
-(let safe_div {a b} (if (= b 0) (Error "division by zero") (Ok (/ a b))))
+(let safe_div {a b}
+  (if (= b 0) (Error "division by zero") (Ok (/ a b))))
 
 ;; `let?` sugar
-(let chained_div {a b c} (let? [x (safe_div a b) y (safe_div x c)] (Ok y)))
+(let chained_div {a b c}
+  (let? [x (safe_div a b) y (safe_div x c)]
+    (Ok y)))
 
 ;; list literal + list pattern match ([] and [h | t])
-(let sum_list {xs} (match xs [] ~> 0 [h | t] ~> (+ h (sum_list t))))
+(let sum_list {xs}
+  (match xs
+    [] ~> 0
+    [h | t] ~> (+ h (sum_list t))))
 
 ;; multi-target + wildcard patterns
-(let pair_tag {x y} (match x y 0 0 ~> "both zero" _ _ ~> "not both zero"))
+(let pair_tag {x y}
+  (match x
+    y 0 0 ~> "both zero"
+    _ _ ~> "not both zero"))
 
 ;; `or` patterns
 (let describe_day {day}
@@ -40,15 +57,19 @@
     _ ~> "weekday"))
 
 ;; record construction + field access
-(let make_box {x} (Box :value x :label "payload"))
+(let make_box {x}
+  (Box :value x :label "payload"))
 
-(let read_value {b} (:value b))
+(let read_value {b}
+  (:value b))
 
 ;; anonymous function (`f`) + higher-order function usage
-(let compose {outer inner} (f {x} -> (outer (inner x))))
+(let compose {outer inner}
+  (f {x} -> (outer (inner x))))
 
 ;; bool operators
-(let logic_demo {a b} (and a (or b False)))
+(let logic_demo {a b}
+  (and a (or b False)))
 
 ;; implicit sequencing in function body + local let bindings + explicit `do`
 (let main {}

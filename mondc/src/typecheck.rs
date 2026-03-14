@@ -1551,7 +1551,8 @@ impl TypeChecker {
                 } => {
                     let mut scheme = type_sig_to_scheme(ty);
                     if *is_nullary {
-                        // {} means 0-arity Erlang function: wrap as Unit -> ReturnType
+                        // Nullary externs are declared as Unit -> ReturnType in source and
+                        // lowered to a 0-arity function internally, so wrap back here.
                         scheme.ty = Rc::new(Type::Fun(Type::unit(), scheme.ty));
                     }
                     self.record_expr_type(name_span.clone(), scheme.ty.clone());
@@ -1742,12 +1743,12 @@ fn type_sig_to_scheme(sig: &crate::ast::TypeSig) -> Scheme {
 
 fn type_usage_to_type(usage: &TypeUsage, params: &HashMap<String, Rc<Type>>) -> Rc<Type> {
     match usage {
-        TypeUsage::Named(name) => Type::con(name, vec![]),
-        TypeUsage::Generic(name) => params
+        TypeUsage::Named(name, _) => Type::con(name, vec![]),
+        TypeUsage::Generic(name, _) => params
             .get(name)
             .cloned()
             .unwrap_or_else(|| Type::con(name, vec![])),
-        TypeUsage::App(head, args) => {
+        TypeUsage::App(head, args, _) => {
             let arg_tys = args.iter().map(|a| type_usage_to_type(a, params)).collect();
             Type::con(head, arg_tys)
         }

@@ -106,6 +106,8 @@ struct LocalOccurrence {
 enum CompletionContext {
     Unqualified { prefix: String },
     Qualified { module: String, prefix: String },
+    ImportPath { root: String, prefix: String },
+    UseImportList { module: String, prefix: String },
 }
 
 pub struct Backend {
@@ -650,6 +652,12 @@ impl LanguageServer for Backend {
             CompletionContext::Qualified { module, prefix } => {
                 project.qualified_completion_items(&module, &prefix)
             }
+            CompletionContext::ImportPath { root, prefix } => {
+                project.import_path_completion_items(&root, &prefix)
+            }
+            CompletionContext::UseImportList { module, prefix } => {
+                project.use_import_list_completion_items(&module, &prefix)
+            }
             CompletionContext::Unqualified { prefix } => project
                 .unqualified_completion_items(&doc, &analysis, offset, &prefix)
                 .map_err(tower_lsp::jsonrpc::Error::invalid_params)?,
@@ -791,6 +799,7 @@ where
 struct Project {
     root: Option<PathBuf>,
     std_modules: BTreeMap<String, ModuleSource>,
+    dep_modules: BTreeMap<String, ModuleSource>,
     src_modules: BTreeMap<String, ModuleSource>,
     test_modules: BTreeMap<String, ModuleSource>,
     analysis: mondc::ProjectAnalysis,
@@ -804,10 +813,16 @@ impl Project {
     ) -> std::result::Result<Self, String> {
         let overlays = state.lock().unwrap().open_docs.clone();
         let std_modules = collect_std_modules(root);
+        let dep_modules = collect_dependency_modules(root);
         let src_modules = collect_modules(root, "src", &overlays);
         let test_modules = collect_modules(root, "tests", &overlays);
         let package_name = package_name_from_manifest(root);
-        let analysis = build_project_analysis(&std_modules, &src_modules, package_name.as_deref())?;
+        let analysis = build_project_analysis(
+            &std_modules,
+            &dep_modules,
+            &src_modules,
+            package_name.as_deref(),
+        )?;
 
         // Ensure an open unsaved file outside src/tests still gets analyzed standalone.
         if let Ok(path) = focus_uri.to_file_path()
@@ -826,6 +841,7 @@ impl Project {
                 return Ok(Self {
                     root: root.map(Path::to_path_buf),
                     std_modules,
+                    dep_modules,
                     src_modules,
                     test_modules,
                     analysis,
@@ -836,6 +852,7 @@ impl Project {
         Ok(Self {
             root: root.map(Path::to_path_buf),
             std_modules,
+            dep_modules,
             src_modules,
             test_modules,
             analysis,
@@ -848,6 +865,7 @@ impl Project {
             .get(&module_name)
             .cloned()
             .or_else(|| self.test_modules.get(&module_name).cloned())
+            .or_else(|| self.dep_modules.get(&module_name).cloned())
             .or_else(|| self.std_modules.get(&module_name).cloned())
     }
 
@@ -855,6 +873,7 @@ impl Project {
         self.src_modules
             .get(module_name)
             .or_else(|| self.test_modules.get(module_name))
+            .or_else(|| self.dep_modules.get(module_name))
             .or_else(|| self.std_modules.get(module_name))
     }
 
@@ -878,6 +897,7 @@ impl Project {
     fn all_modules(&self) -> Vec<ModuleSource> {
         self.std_modules
             .values()
+            .chain(self.dep_modules.values())
             .chain(self.src_modules.values())
             .chain(self.test_modules.values())
             .cloned()
@@ -962,6 +982,122 @@ impl Project {
                     }),
             );
         }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
+    fn import_path_completion_items(&self, root: &str, prefix: &str) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+
+        for module_name in self.importable_module_names(root) {
+            if !module_name.starts_with(prefix) {
+                continue;
+            }
+            push_completion_item(
+                &mut items,
+                &mut seen,
+                completion_item(
+                    module_name,
+                    CompletionItemKind::MODULE,
+                    Some(format!("{root} module")),
+                    None,
+                ),
+            );
+        }
+
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
+    fn use_import_list_completion_items(&self, module: &str, prefix: &str) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        let docs = self.top_level_docs_for_module(module);
+
+        if let Some(schemes) = self.analysis.all_module_schemes.get(module) {
+            for (name, scheme) in schemes {
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                push_completion_item(
+                    &mut items,
+                    &mut seen,
+                    completion_item(
+                        name.clone(),
+                        CompletionItemKind::FUNCTION,
+                        Some(format!(
+                            "{module} | {}",
+                            mondc::typecheck::type_display(&scheme.ty)
+                        )),
+                        docs.get(name).cloned(),
+                    ),
+                );
+            }
+        }
+
+        if let Some(exports) = self.analysis.module_exports.get(module) {
+            for name in exports {
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                push_completion_item(
+                    &mut items,
+                    &mut seen,
+                    completion_item(
+                        name.clone(),
+                        CompletionItemKind::FUNCTION,
+                        Some(format!("{module} export")),
+                        docs.get(name).cloned(),
+                    ),
+                );
+            }
+        }
+
+        if let Some(type_decls) = self.analysis.module_type_decls.get(module) {
+            for type_decl in type_decls {
+                let (name, kind) = match type_decl {
+                    mondc::ast::TypeDecl::Record { name, .. } => {
+                        (name.clone(), CompletionItemKind::STRUCT)
+                    }
+                    mondc::ast::TypeDecl::Variant { name, .. } => {
+                        (name.clone(), CompletionItemKind::ENUM)
+                    }
+                };
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                push_completion_item(
+                    &mut items,
+                    &mut seen,
+                    completion_item(
+                        name.clone(),
+                        kind,
+                        Some(format!("{module} type")),
+                        docs.get(&name).cloned(),
+                    ),
+                );
+            }
+        }
+
+        if let Some(extern_types) = self.analysis.module_extern_types.get(module) {
+            for name in extern_types {
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                push_completion_item(
+                    &mut items,
+                    &mut seen,
+                    completion_item(
+                        name.clone(),
+                        CompletionItemKind::CLASS,
+                        Some(format!("{module} extern type")),
+                        docs.get(name).cloned(),
+                    ),
+                );
+            }
+        }
+
         items.sort_by(|a, b| a.label.cmp(&b.label));
         items
     }
@@ -1083,6 +1219,41 @@ impl Project {
         modules
     }
 
+    fn importable_module_names(&self, root: &str) -> Vec<String> {
+        let mut modules = Vec::new();
+
+        if root == "std" {
+            modules.extend(
+                self.std_modules
+                    .keys()
+                    .filter(|name| name.as_str() != "std")
+                    .cloned(),
+            );
+        }
+
+        modules.extend(
+            self.dep_modules
+                .values()
+                .filter(|module| dependency_name_for_module_path(&module.path) == Some(root))
+                .map(|module| module.name.clone()),
+        );
+
+        if self.root.is_some()
+            && package_name_from_manifest(self.root.as_deref()).as_deref() == Some(root)
+        {
+            modules.extend(
+                self.src_modules
+                    .keys()
+                    .filter(|name| name.as_str() != "lib")
+                    .cloned(),
+            );
+        }
+
+        modules.sort();
+        modules.dedup();
+        modules
+    }
+
     fn top_level_docs_for_module(&self, module: &str) -> HashMap<String, String> {
         self.module_named(module)
             .and_then(|module| top_level_docs(&module.path, &module.source).ok())
@@ -1147,6 +1318,7 @@ impl Project {
             &visible_exports,
             imports.module_aliases.clone(),
             &imports.imported_type_decls,
+            &imports.imported_extern_types,
             &imports.imported_field_indices,
             &imports.imported_schemes,
         );
@@ -1182,6 +1354,7 @@ impl Project {
 
 fn build_project_analysis(
     std_modules: &BTreeMap<String, ModuleSource>,
+    dep_modules: &BTreeMap<String, ModuleSource>,
     src_modules: &BTreeMap<String, ModuleSource>,
     package_name: Option<&str>,
 ) -> std::result::Result<mondc::ProjectAnalysis, String> {
@@ -1189,12 +1362,14 @@ fn build_project_analysis(
         .iter()
         .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect::<Vec<(String, String)>>();
-    let std_mods = mondc::std_modules_from_sources(&std_mods)?;
+    let mut external_mods = mondc::std_modules_from_sources(&std_mods)?;
+    external_mods.extend(load_dependency_analysis_modules(dep_modules));
     let src_module_sources: Vec<(String, String)> = src_modules
         .iter()
         .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect();
-    let mut analysis = mondc::build_project_analysis(&std_mods, &src_module_sources)?;
+    let mut analysis =
+        mondc::build_project_analysis_with_modules(&external_mods, &src_module_sources)?;
     if let Some(package_name) = package_name {
         mondc::alias_package_root_module(&mut analysis, package_name)?;
     }
@@ -1318,6 +1493,76 @@ fn collect_std_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
         modules.insert(name, module);
     }
     modules
+}
+
+fn collect_dependency_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
+    let Some(root) = root else {
+        return BTreeMap::new();
+    };
+    let deps_root = root.join("target").join("deps");
+    let Ok(entries) = fs::read_dir(&deps_root) else {
+        return BTreeMap::new();
+    };
+
+    let mut modules = BTreeMap::new();
+    for entry in entries.flatten() {
+        let dep_dir = entry.path();
+        if !dep_dir.is_dir() {
+            continue;
+        }
+        let dep_name = dep_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if dep_name.is_empty() || dep_name == "std" {
+            continue;
+        }
+        let src_dir = dep_dir.join("src");
+        let mut discovered = BTreeMap::new();
+        collect_mond_files_from_dir(&src_dir, &mut discovered);
+        for (_, mut module) in discovered {
+            let module_name = if module.name == "lib" {
+                dep_name.to_string()
+            } else {
+                module.name.clone()
+            };
+            module.name = module_name.clone();
+            modules.insert(module_name, module);
+        }
+    }
+    modules
+}
+
+fn load_dependency_analysis_modules(
+    dep_modules: &BTreeMap<String, ModuleSource>,
+) -> Vec<(String, String, String)> {
+    let mut loaded = Vec::new();
+    let mut dep_dirs = BTreeMap::new();
+    for module in dep_modules.values() {
+        let Some(dep_dir) = module.path.ancestors().find(|ancestor| {
+            ancestor.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("deps"))
+        }) else {
+            continue;
+        };
+        let dep_name = dep_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if dep_name.is_empty() {
+            continue;
+        }
+        dep_dirs
+            .entry(dep_name)
+            .or_insert_with(|| dep_dir.to_path_buf());
+    }
+    for (dep_name, dep_dir) in dep_dirs {
+        if let Ok(dep_loaded) = mondc::load_dependency_modules_from_checkout(&dep_name, &dep_dir) {
+            loaded.extend(dep_loaded);
+        }
+    }
+    loaded
 }
 
 fn find_top_level_definition_range(
@@ -1594,10 +1839,20 @@ fn completion_context(source: &str, offset: usize) -> Option<CompletionContext> 
     let prefix_start = scan_ident_start(source, offset);
     let prefix = source[prefix_start..offset].to_string();
 
+    if let Some(module) = use_import_list_module_at(source, prefix_start) {
+        return Some(CompletionContext::UseImportList { module, prefix });
+    }
+
     if prefix_start > 0 && source.as_bytes()[prefix_start - 1] == b'/' {
         let module_end = prefix_start - 1;
         let module_start = scan_ident_start(source, module_end);
         if module_start < module_end {
+            if is_use_import_path_context(source, module_start) {
+                return Some(CompletionContext::ImportPath {
+                    root: source[module_start..module_end].to_string(),
+                    prefix,
+                });
+            }
             return Some(CompletionContext::Qualified {
                 module: source[module_start..module_end].to_string(),
                 prefix,
@@ -1619,6 +1874,108 @@ fn scan_ident_start(source: &str, offset: usize) -> usize {
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_use_import_path_context(source: &str, module_start: usize) -> bool {
+    let Some(list_start) = enclosing_round_list_start(source, module_start) else {
+        return false;
+    };
+    let head = source[list_start + 1..module_start]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    matches!(head.as_slice(), ["use"] | ["pub", "use"])
+}
+
+fn enclosing_round_list_start(source: &str, offset: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut round_depth = 0usize;
+
+    for idx in (0..offset).rev() {
+        match bytes[idx] {
+            b')' => round_depth += 1,
+            b'(' => {
+                if round_depth == 0 {
+                    return Some(idx);
+                }
+                round_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn dependency_name_for_module_path(path: &Path) -> Option<&str> {
+    path.ancestors().find_map(|ancestor| {
+        let parent = ancestor.parent()?;
+        if parent.file_name()? != std::ffi::OsStr::new("deps") {
+            return None;
+        }
+        ancestor.file_name()?.to_str()
+    })
+}
+
+fn use_import_list_module_at(source: &str, offset: usize) -> Option<String> {
+    let list_start = enclosing_round_list_start(source, offset)?;
+    let bytes = source.as_bytes();
+    let mut idx = list_start + 1;
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+
+    if source.get(idx..)?.starts_with("pub") {
+        let next = idx + 3;
+        if next >= bytes.len() || !bytes[next].is_ascii_whitespace() {
+            return None;
+        }
+        idx = next;
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+    }
+
+    if !source.get(idx..)?.starts_with("use") {
+        return None;
+    }
+    let next = idx + 3;
+    if next >= bytes.len() || !bytes[next].is_ascii_whitespace() {
+        return None;
+    }
+    idx = next;
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+
+    let path_start = idx;
+    while idx < bytes.len() && (is_ident_byte(bytes[idx]) || bytes[idx] == b'/') {
+        idx += 1;
+    }
+    if path_start == idx {
+        return None;
+    }
+    let module_path = &source[path_start..idx];
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() || bytes[idx] != b'[' || offset < idx + 1 {
+        return None;
+    }
+
+    if source[idx + 1..offset].contains(']') {
+        return None;
+    }
+
+    Some(
+        module_path
+            .rsplit_once('/')
+            .map(|(_, module)| module)
+            .unwrap_or(module_path)
+            .to_string(),
+    )
 }
 
 fn local_names_at_offset(
@@ -2814,6 +3171,18 @@ fn bind_pattern_names(pat: &mondc::ast::Pattern, out: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("mond-lsp-test-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn position_offset_roundtrip_handles_ascii() {
@@ -2888,6 +3257,7 @@ mod tests {
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_extern_types: Vec::new(),
             imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
@@ -2914,6 +3284,7 @@ mod tests {
             import_origins,
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_extern_types: Vec::new(),
             imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
@@ -2940,6 +3311,7 @@ mod tests {
             import_origins,
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_extern_types: Vec::new(),
             imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
@@ -2967,6 +3339,32 @@ mod tests {
             Some(CompletionContext::Qualified { module, prefix }) => {
                 assert_eq!(module, "io");
                 assert_eq!(prefix, "pri");
+            }
+            other => panic!("unexpected completion context: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_context_detects_use_import_path_prefix() {
+        let src = "(use std/pr)";
+        let offset = src.find("pr").unwrap() + 2;
+        match completion_context(src, offset) {
+            Some(CompletionContext::ImportPath { root, prefix }) => {
+                assert_eq!(root, "std");
+                assert_eq!(prefix, "pr");
+            }
+            other => panic!("unexpected completion context: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_context_detects_use_import_list_prefix() {
+        let src = "(use std/process [sp)";
+        let offset = src.find("sp").unwrap() + 2;
+        match completion_context(src, offset) {
+            Some(CompletionContext::UseImportList { module, prefix }) => {
+                assert_eq!(module, "process");
+                assert_eq!(prefix, "sp");
             }
             other => panic!("unexpected completion context: {other:?}"),
         }
@@ -3025,9 +3423,149 @@ mod tests {
     }
 
     #[test]
+    fn import_path_completion_items_include_std_submodules() {
+        let std_modules = BTreeMap::from([
+            (
+                "std".to_string(),
+                ModuleSource {
+                    name: "std".to_string(),
+                    path: PathBuf::from("std/lib.mond"),
+                    source: "(pub let hello {} 1)".to_string(),
+                },
+            ),
+            (
+                "process".to_string(),
+                ModuleSource {
+                    name: "process".to_string(),
+                    path: PathBuf::from("std/process.mond"),
+                    source: "(pub let exit {} 1)".to_string(),
+                },
+            ),
+        ]);
+        let project = Project {
+            root: None,
+            std_modules: std_modules.clone(),
+            dep_modules: BTreeMap::new(),
+            src_modules: BTreeMap::new(),
+            test_modules: BTreeMap::new(),
+            analysis: build_project_analysis(
+                &std_modules,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None,
+            )
+            .expect("project analysis"),
+        };
+
+        let labels = project
+            .import_path_completion_items("std", "pr")
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["process".to_string()]);
+    }
+
+    #[test]
+    fn use_import_list_completion_items_include_std_process_exports() {
+        let std_modules = BTreeMap::from([
+            (
+                "std".to_string(),
+                ModuleSource {
+                    name: "std".to_string(),
+                    path: PathBuf::from("std/lib.mond"),
+                    source: "(pub let hello {} 1)".to_string(),
+                },
+            ),
+            (
+                "process".to_string(),
+                ModuleSource {
+                    name: "process".to_string(),
+                    path: PathBuf::from("std/process.mond"),
+                    source: "(pub let spawn {task} task)\n\
+                             (let hidden {} 1)\n\
+                             (pub let sleep {ms} ms)\n\
+                             (pub type ExitReason [Normal])\n\
+                             (pub extern type ['p] Selector)"
+                        .to_string(),
+                },
+            ),
+        ]);
+        let project = Project {
+            root: None,
+            std_modules: std_modules.clone(),
+            dep_modules: BTreeMap::new(),
+            src_modules: BTreeMap::new(),
+            test_modules: BTreeMap::new(),
+            analysis: build_project_analysis(
+                &std_modules,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None,
+            )
+            .expect("project analysis"),
+        };
+
+        let labels = project
+            .use_import_list_completion_items("process", "s")
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["sleep".to_string(), "spawn".to_string()]);
+    }
+
+    #[test]
+    fn use_import_list_completion_items_include_extern_types() {
+        let std_modules = BTreeMap::from([
+            (
+                "std".to_string(),
+                ModuleSource {
+                    name: "std".to_string(),
+                    path: PathBuf::from("std/lib.mond"),
+                    source: "(pub let hello {} 1)".to_string(),
+                },
+            ),
+            (
+                "process".to_string(),
+                ModuleSource {
+                    name: "process".to_string(),
+                    path: PathBuf::from("std/process.mond"),
+                    source: "(pub let spawn {task} task)\n\
+                             (pub type ExitReason [Normal])\n\
+                             (pub extern type ['p] Selector)"
+                        .to_string(),
+                },
+            ),
+        ]);
+        let project = Project {
+            root: None,
+            std_modules: std_modules.clone(),
+            dep_modules: BTreeMap::new(),
+            src_modules: BTreeMap::new(),
+            test_modules: BTreeMap::new(),
+            analysis: build_project_analysis(
+                &std_modules,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None,
+            )
+            .expect("project analysis"),
+        };
+
+        let labels = project
+            .use_import_list_completion_items("process", "Sel")
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["Selector".to_string()]);
+    }
+
+    #[test]
     fn top_level_symbols_collect_functions_and_types() {
         let src = "(type Option [None])\n\
-                   (extern let debug {} ~ String io/debug)\n\
+                   (extern let debug ~ (Unit -> String) io/debug)\n\
                    (let main {} (debug))";
         let symbols = top_level_symbols(Path::new("src/main.mond"), src).unwrap();
         let names: Vec<_> = symbols.into_iter().map(|symbol| symbol.name).collect();
@@ -3066,6 +3604,7 @@ mod tests {
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_extern_types: Vec::new(),
             imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
@@ -3086,6 +3625,7 @@ mod tests {
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
             imported_type_decls: Vec::new(),
+            imported_extern_types: Vec::new(),
             imported_field_indices: HashMap::new(),
             module_aliases: HashMap::new(),
         };
@@ -3148,7 +3688,8 @@ mod tests {
             ),
         ]);
         let analysis =
-            build_project_analysis(&std_modules, &BTreeMap::new(), None).expect("project analysis");
+            build_project_analysis(&std_modules, &BTreeMap::new(), &BTreeMap::new(), None)
+                .expect("project analysis");
         let imports = mondc::resolve_imports_for_source(
             "(use std/io)\n(let main {} ())",
             &analysis.module_exports,
@@ -3168,8 +3709,13 @@ mod tests {
                 source: "(pub let now {} 1)".to_string(),
             },
         )]);
-        let analysis = build_project_analysis(&BTreeMap::new(), &src_modules, Some("time"))
-            .expect("project analysis");
+        let analysis = build_project_analysis(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &src_modules,
+            Some("time"),
+        )
+        .expect("project analysis");
         let imports = mondc::resolve_imports_for_source(
             "(use time)\n(let main {} (time/now))",
             &analysis.module_exports,
@@ -3181,6 +3727,32 @@ mod tests {
             imports.module_aliases.get("time").map(String::as_str),
             Some("lib")
         );
+    }
+
+    #[test]
+    fn collect_dependency_modules_and_analysis_include_cached_dependencies() {
+        let root = unique_temp_root();
+        let dep_src = root.join("target").join("deps").join("time").join("src");
+        fs::create_dir_all(&dep_src).expect("create dependency src");
+        fs::write(dep_src.join("lib.mond"), "(pub let now {} 1)").expect("write lib");
+        fs::write(dep_src.join("duration.mond"), "(pub let seconds {} 1)")
+            .expect("write submodule");
+
+        let dep_modules = collect_dependency_modules(Some(&root));
+        assert!(dep_modules.contains_key("time"));
+        assert!(dep_modules.contains_key("duration"));
+
+        let analysis =
+            build_project_analysis(&BTreeMap::new(), &dep_modules, &BTreeMap::new(), None)
+                .expect("project analysis");
+        assert!(analysis.module_exports.contains_key("time"));
+        assert!(analysis.module_exports.contains_key("duration"));
+        assert_eq!(
+            analysis.module_aliases.get("time").map(String::as_str),
+            Some("d_time_time")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3230,10 +3802,16 @@ mod tests {
         let project = Project {
             root: None,
             std_modules: BTreeMap::new(),
+            dep_modules: BTreeMap::new(),
             src_modules: src_modules.clone(),
             test_modules: BTreeMap::new(),
-            analysis: build_project_analysis(&BTreeMap::new(), &src_modules, None)
-                .expect("project analysis"),
+            analysis: build_project_analysis(
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &src_modules,
+                None,
+            )
+            .expect("project analysis"),
         };
 
         let batches =

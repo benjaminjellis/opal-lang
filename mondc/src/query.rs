@@ -94,6 +94,19 @@ pub fn exported_type_decls(source: &str) -> Vec<ast::TypeDecl> {
         .collect()
 }
 
+pub fn exported_extern_types(source: &str) -> Vec<String> {
+    parse_decls("scan.mond", source)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| match d {
+            ast::Declaration::ExternType {
+                is_pub: true, name, ..
+            } => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn infer_module_bindings(
     module_name: &str,
     source: &str,

@@ -337,8 +337,7 @@ fn fmt_type(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Do
             fmt(params, source),
             text(" "),
             text(atom_text(name, source)),
-            text(" "),
-            fmt_type_body(body, source),
+            nest(2, concat(hardline(), fmt_type_body(body, source))),
             text(")"),
         ]),
 
@@ -347,8 +346,7 @@ fn fmt_type(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Do
             text("("),
             prefix,
             text(atom_text(name, source)),
-            text(" "),
-            fmt_type_body(body, source),
+            nest(2, concat(hardline(), fmt_type_body(body, source))),
             text(")"),
         ]),
 
@@ -363,7 +361,7 @@ fn fmt_type_body(items: &[SExpr], source: &str) -> Doc {
     }
     let entries: Vec<Doc> = items.iter().map(|i| fmt(i, source)).collect();
     let inner = join(hardline(), entries);
-    concat_all([text("["), nest(2, concat(hardline(), inner)), text("]")])
+    concat_all([text("["), align(inner), text("]")])
 }
 
 // ── if ────────────────────────────────────────────────────────────────────────

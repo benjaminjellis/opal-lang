@@ -8,4 +8,6 @@
     10 or 11 or 12 ~> (println "expected")
     _ ~> (println "not expected")))
 
-(let main {} (let [x 10 y 10] (check x y)))
+(let main {}
+  (let [x 10 y 10]
+    (check x y)))

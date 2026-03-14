@@ -1,2 +1,3 @@
 ;; Error: occurs check — `f` applied to itself produces an infinite type
-(let recur {x} (recur recur))
+(let recur {x}
+  (recur recur))

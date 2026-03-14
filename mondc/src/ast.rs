@@ -29,7 +29,7 @@ pub enum Declaration {
     /// For (let f {a} ...)
     Expression(Expr),
     /// For (extern let name ~ (A -> B) module/function)
-    /// or  (extern let name {} ~ ReturnType module/function)  -- nullary Erlang function
+    /// or  (extern let name ~ (Unit -> ReturnType) module/function)  -- nullary Erlang function
     ExternLet {
         name: String,
         name_span: Range<usize>,
@@ -215,7 +215,17 @@ impl Expr {
 /// A reference to a type in source code
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeUsage {
-    Named(String),               // e.g. Int, String, MyType
-    Generic(String),             // e.g. 'a, 't
-    App(String, Vec<TypeUsage>), // e.g. App("Option", [Generic("'a")])
+    Named(String, Range<usize>),               // e.g. Int, String, MyType
+    Generic(String, Range<usize>),             // e.g. 'a, 't
+    App(String, Vec<TypeUsage>, Range<usize>), // e.g. App("Option", [Generic("'a")])
+}
+
+impl TypeUsage {
+    pub fn span(&self) -> Range<usize> {
+        match self {
+            TypeUsage::Named(_, span)
+            | TypeUsage::Generic(_, span)
+            | TypeUsage::App(_, _, span) => span.clone(),
+        }
+    }
 }

@@ -45,11 +45,7 @@ impl Lowerer {
         // 1. Parse optional generics: ['t] or ['e 'a]
         let mut params = Vec::new();
         if let Some(SExpr::Square(gen_items, _)) = items.get(cursor) {
-            for s in gen_items {
-                if let SExpr::Atom(t) = s {
-                    params.push(self.source_at(file_id, t.span.clone()).to_string());
-                }
-            }
+            params = self.lower_type_params(file_id, gen_items)?;
             cursor += 1;
         }
 
@@ -979,16 +975,19 @@ impl Lowerer {
         Some(Expr::RecordConstruct { name, fields, span })
     }
 
-    /// Parse a flat sequence of atoms as a `TypeUsage`.
-    ///   - 1 atom  → `Named("Int")` or `Generic("'a")`
-    ///   - N atoms → `App("Option", [Generic("'a")])`, `App("Map", [Generic("'k"), Generic("'v")])`
+    /// Parse a type usage after `~`.
+    /// Supported forms include:
+    ///   - `Int`
+    ///   - `Option 'a`
+    ///   - `Map 'k 'v`
+    ///   - `(Selector (Option 'm))`
     fn lower_type_usage_atoms(
         &mut self,
         file_id: usize,
-        atoms: &[SExpr],
+        items: &[SExpr],
         err_span: std::ops::Range<usize>,
     ) -> Option<TypeUsage> {
-        if atoms.is_empty() {
+        if items.is_empty() {
             self.error(
                 Diagnostic::error()
                     .with_message("expected a type after `~`")
@@ -998,7 +997,44 @@ impl Lowerer {
             );
             return None;
         }
-        let head_sexpr = &atoms[0];
+        if items.len() == 1 {
+            return self.lower_type_usage_sexpr(file_id, &items[0]);
+        }
+        self.lower_type_usage_application(file_id, items, err_span)
+    }
+
+    fn lower_type_usage_sexpr(&mut self, file_id: usize, sexpr: &SExpr) -> Option<TypeUsage> {
+        match sexpr {
+            SExpr::Atom(token) => {
+                let text = self.source_at(file_id, token.span.clone()).to_string();
+                Some(match token.kind {
+                    TokenKind::Generic => TypeUsage::Generic(text, token.span.clone()),
+                    _ => TypeUsage::Named(text, token.span.clone()),
+                })
+            }
+            SExpr::Round(items, span) => {
+                self.lower_type_usage_application(file_id, items, span.clone())
+            }
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected a type")
+                        .with_labels(vec![Label::primary(file_id, other.span()).with_message(
+                        "expected a type variable, type name, or parenthesised type application",
+                    )]),
+                );
+                None
+            }
+        }
+    }
+
+    fn lower_type_usage_application(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: std::ops::Range<usize>,
+    ) -> Option<TypeUsage> {
+        let head_sexpr = &items[0];
         let SExpr::Atom(head_tok) = head_sexpr else {
             self.error(
                 Diagnostic::error()
@@ -1008,33 +1044,19 @@ impl Lowerer {
             return None;
         };
         let head_text = self.source_at(file_id, head_tok.span.clone()).to_string();
-        if atoms.len() == 1 {
+        if items.len() == 1 {
             return Some(match head_tok.kind {
-                TokenKind::Generic => TypeUsage::Generic(head_text),
-                _ => TypeUsage::Named(head_text),
+                TokenKind::Generic => TypeUsage::Generic(head_text, head_tok.span.clone()),
+                _ => TypeUsage::Named(head_text, head_tok.span.clone()),
             });
         }
-        // Multiple atoms: head is the constructor, rest are type arguments.
+        // Multiple items: head is the constructor, rest are type arguments.
         let mut args = Vec::new();
-        for arg_sexpr in &atoms[1..] {
-            let SExpr::Atom(arg_tok) = arg_sexpr else {
-                self.error(
-                    Diagnostic::error()
-                        .with_message("expected a type argument")
-                        .with_labels(vec![
-                            Label::primary(file_id, arg_sexpr.span())
-                                .with_message("expected a type variable or type name"),
-                        ]),
-                );
-                return None;
-            };
-            let arg_text = self.source_at(file_id, arg_tok.span.clone()).to_string();
-            args.push(match arg_tok.kind {
-                TokenKind::Generic => TypeUsage::Generic(arg_text),
-                _ => TypeUsage::Named(arg_text),
-            });
+        for arg_sexpr in &items[1..] {
+            let arg = self.lower_type_usage_sexpr(file_id, arg_sexpr)?;
+            args.push(arg);
         }
-        Some(TypeUsage::App(head_text, args))
+        Some(TypeUsage::App(head_text, args, span))
     }
 
     /// Parse a type signature used inside `extern` declarations.
@@ -1180,7 +1202,7 @@ impl Lowerer {
 
     /// Lower an `extern let` declaration.
     /// Syntax: (extern let name ~ (TypeSig) module/function)
-    ///      or (extern let name {} ~ ReturnType module/function)  -- nullary
+    ///      or (extern let name ~ (Unit -> ReturnType) module/function)  -- nullary
     fn lower_extern_let(
         &mut self,
         file_id: usize,
@@ -1188,9 +1210,7 @@ impl Lowerer {
         span: Range<usize>,
         is_pub: bool,
     ) -> Option<Declaration> {
-        // items[0]=extern, items[1]=let, items[2]=name, then either:
-        //   nullary: items[3]={}, items[4]=~, items[5]=ReturnType, items[6]=target  (len=7)
-        //   normal:  items[3]=~, items[4]=TypeSig, items[5]=target                  (len=6)
+        // items[0]=extern, items[1]=let, items[2]=name, items[3]=~, items[4]=TypeSig, items[5]=target
 
         let name = match &items[2] {
             SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
@@ -1206,28 +1226,20 @@ impl Lowerer {
             }
         };
 
-        // Detect nullary: items[3] is an empty Curly {}
-        let is_nullary = matches!(items.get(3), Some(SExpr::Curly(args, _)) if args.is_empty());
-        let (tilde_idx, type_idx, target_idx, expected_len) = if is_nullary {
-            (4, 5, 6, 7)
-        } else {
-            (3, 4, 5, 6)
-        };
-
-        if items.len() != expected_len {
+        if items.len() != 6 {
             self.error(
                 Diagnostic::error()
                     .with_message("invalid extern let declaration")
                     .with_labels(vec![Label::primary(file_id, span.clone())])
                     .with_notes(vec![
                         "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
-                        "syntax: (extern let name {} ~ ReturnType module/function)".into(),
+                        "syntax: (extern let name ~ (Unit -> ReturnType) module/function)".into(),
                     ]),
             );
             return None;
         }
 
-        match &items[tilde_idx] {
+        match &items[3] {
             SExpr::Atom(t) if matches!(t.kind, TokenKind::Tilde) => {}
             other => {
                 self.error(
@@ -1236,15 +1248,23 @@ impl Lowerer {
                         .with_labels(vec![Label::primary(file_id, other.span())])
                         .with_notes(vec![
                             "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
+                            "syntax: (extern let name ~ (Unit -> ReturnType) module/function)"
+                                .into(),
                         ]),
                 );
                 return None;
             }
         }
 
-        let ty = self.lower_type_sig(file_id, &items[type_idx])?;
+        let raw_ty = self.lower_type_sig(file_id, &items[4])?;
+        let (is_nullary, ty) = match raw_ty {
+            TypeSig::Fun(arg, ret) if matches!(arg.as_ref(), TypeSig::Named(name) if name == "Unit") => {
+                (true, *ret)
+            }
+            other => (false, other),
+        };
 
-        let erlang_target = match &items[target_idx] {
+        let erlang_target = match &items[5] {
             SExpr::Atom(t) => match &t.kind {
                 TokenKind::QualifiedIdent((module, func)) => (module.clone(), func.clone()),
                 _ => {
@@ -1297,11 +1317,7 @@ impl Lowerer {
 
         let mut params = Vec::new();
         if let Some(SExpr::Square(gen_items, _)) = items.get(cursor) {
-            for s in gen_items {
-                if let SExpr::Atom(t) = s {
-                    params.push(self.source_at(file_id, t.span.clone()).to_string());
-                }
-            }
+            params = self.lower_type_params(file_id, gen_items)?;
             cursor += 1;
         }
 
@@ -1375,6 +1391,36 @@ impl Lowerer {
             erlang_target,
             span,
         })
+    }
+
+    fn lower_type_params(&mut self, file_id: usize, gen_items: &[SExpr]) -> Option<Vec<String>> {
+        let mut params = Vec::new();
+        for item in gen_items {
+            let SExpr::Atom(token) = item else {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("type parameters must be generic variables")
+                        .with_labels(vec![Label::primary(file_id, item.span())])
+                        .with_notes(vec![
+                            "type parameters must look like `'a` or `'state`".into(),
+                        ]),
+                );
+                return None;
+            };
+            if !matches!(token.kind, TokenKind::Generic) {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("type parameters must start with `'`")
+                        .with_labels(vec![
+                            Label::primary(file_id, token.span.clone())
+                                .with_message("expected a generic type variable like `'a`"),
+                        ]),
+                );
+                return None;
+            }
+            params.push(self.source_at(file_id, token.span.clone()).to_string());
+        }
+        Some(params)
     }
 
     /// Lower a `use` declaration.
@@ -2316,15 +2362,45 @@ mod tests {
         {
             assert_eq!(name, "MyGenericType");
             assert_eq!(params, &vec!["'t".to_string()]);
-            assert_eq!(
-                fields,
-                &vec![
-                    ("name".into(), TypeUsage::Named("String".into())),
-                    ("data".into(), TypeUsage::Generic("'t".into())),
-                ]
-            );
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "name");
+            assert!(matches!(&fields[0].1, TypeUsage::Named(name, _) if name == "String"));
+            assert_eq!(fields[1].0, "data");
+            assert!(matches!(&fields[1].1, TypeUsage::Generic(name, _) if name == "'t"));
         } else {
             panic!("expected a generic record type");
+        }
+    }
+
+    #[test]
+    fn test_record_type_with_nested_type_application() {
+        let (mut lowerer, file_id, sexprs) = setup(
+            "
+                (extern type ['p] Selector)
+                (type ['m] ContinuePayload [
+                    (:select ~ (Selector (Option 'm)))
+                ])",
+        );
+
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        if let Declaration::Type(TypeDecl::Record { fields, .. }) = &exprs[1] {
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].0, "select");
+            assert!(matches!(
+                &fields[0].1,
+                TypeUsage::App(selector, args, _)
+                    if selector == "Selector"
+                        && args.len() == 1
+                        && matches!(
+                            &args[0],
+                            TypeUsage::App(option, option_args, _)
+                                if option == "Option"
+                                    && option_args.len() == 1
+                                    && matches!(&option_args[0], TypeUsage::Generic(name, _) if name == "'m")
+                        )
+            ));
+        } else {
+            panic!("expected nested type application record type");
         }
     }
 
@@ -2348,14 +2424,13 @@ mod tests {
         {
             assert_eq!(name, "MyType");
             assert_eq!(*params, Vec::<String>::new());
-            assert_eq!(
-                fields,
-                &vec![
-                    ("field_one".into(), TypeUsage::Named("String".into())),
-                    ("field_two".into(), TypeUsage::Named("Int".into())),
-                    ("field_three".into(), TypeUsage::Named("Bool".into())),
-                ]
-            );
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].0, "field_one");
+            assert!(matches!(&fields[0].1, TypeUsage::Named(name, _) if name == "String"));
+            assert_eq!(fields[1].0, "field_two");
+            assert!(matches!(&fields[1].1, TypeUsage::Named(name, _) if name == "Int"));
+            assert_eq!(fields[2].0, "field_three");
+            assert!(matches!(&fields[2].1, TypeUsage::Named(name, _) if name == "Bool"));
         } else {
             panic!("expected a type not an expression")
         }
@@ -2379,13 +2454,11 @@ mod tests {
             assert!(*is_pub);
             assert_eq!(name, "ExitMessage");
             assert!(params.is_empty());
-            assert_eq!(
-                fields,
-                &vec![
-                    ("pid".into(), TypeUsage::Named("Pid".into())),
-                    ("reason".into(), TypeUsage::Named("ExitReason".into())),
-                ]
-            );
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "pid");
+            assert!(matches!(&fields[0].1, TypeUsage::Named(name, _) if name == "Pid"));
+            assert_eq!(fields[1].0, "reason");
+            assert!(matches!(&fields[1].1, TypeUsage::Named(name, _) if name == "ExitReason"));
         } else {
             panic!("expected a record type declaration");
         }
@@ -2698,14 +2771,14 @@ mod tests {
             assert!(*is_pub);
             assert_eq!(name, "ExitReason");
             assert_eq!(params, &vec!["'a".to_string()]);
-            assert_eq!(
-                constructors,
-                &vec![
-                    ("Normal".into(), None),
-                    ("Killed".into(), None),
-                    ("Abnormal".into(), Some(TypeUsage::Generic("'a".into()))),
-                ]
-            );
+            assert_eq!(constructors.len(), 3);
+            assert_eq!(constructors[0], ("Normal".into(), None));
+            assert_eq!(constructors[1], ("Killed".into(), None));
+            assert_eq!(constructors[2].0, "Abnormal");
+            assert!(matches!(
+                &constructors[2].1,
+                Some(TypeUsage::Generic(name, _)) if name == "'a"
+            ));
         } else {
             panic!("expected Variant type declaration");
         }
@@ -3452,6 +3525,32 @@ mod tests {
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty(), "expected lowering to fail");
         assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_type_params_require_quote_prefix() {
+        let src = "(type ['a b] Pair [(:left ~ 'a) (:right ~ b)])";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "type parameters must start with `'`"
+        );
+    }
+
+    #[test]
+    fn test_extern_type_params_require_quote_prefix() {
+        let src = "(extern type ['k v] Dict maps/map)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "type parameters must start with `'`"
+        );
     }
 
     #[test]

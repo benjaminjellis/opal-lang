@@ -182,6 +182,7 @@ pub(crate) struct ErlSources {
     // Compilation state exposed for `mond test`
     pub module_exports: HashMap<String, Vec<String>>,
     pub module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>>,
+    pub module_extern_types: HashMap<String, Vec<String>>,
     pub all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv>,
     pub dependency_mods: Vec<(String, String, String)>,
     pub module_aliases: HashMap<String, String>,
@@ -275,6 +276,7 @@ pub(crate) fn generate_erl_sources_with_roots(
     // Phase 1: scan each module's source to collect its exported function names and type decls
     let mut module_exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>> = HashMap::new();
+    let mut module_extern_types: HashMap<String, Vec<String>> = HashMap::new();
     let mut module_sources: Vec<(String, String)> = Vec::new(); // (module_name, source)
 
     for mond_path in &mond_files {
@@ -289,8 +291,10 @@ pub(crate) fn generate_erl_sources_with_roots(
 
         let exports = mondc::exported_names(&source);
         let type_decls = mondc::exported_type_decls(&source);
+        let extern_types = mondc::exported_extern_types(&source);
         module_exports.insert(module_name.clone(), exports);
         module_type_decls.insert(module_name.clone(), type_decls);
+        module_extern_types.insert(module_name.clone(), extern_types);
         module_sources.push((module_name, source));
     }
     ensure_no_local_dependency_module_conflicts(&module_sources, &dependency_mods)?;
@@ -305,6 +309,7 @@ pub(crate) fn generate_erl_sources_with_roots(
     apply_local_module_aliases(&mut analysis, &module_sources, &manifest.package.name);
     module_exports = analysis.module_exports.clone();
     module_type_decls = analysis.module_type_decls.clone();
+    module_extern_types = analysis.module_extern_types.clone();
     let all_module_schemes = analysis.all_module_schemes.clone();
     let module_aliases = analysis.module_aliases.clone();
     let selected_module_sources =
@@ -362,6 +367,7 @@ pub(crate) fn generate_erl_sources_with_roots(
             &module_exports,
             resolved.module_aliases,
             &resolved.imported_type_decls,
+            &resolved.imported_extern_types,
             &resolved.imported_field_indices,
             &resolved.imported_schemes,
         );
@@ -420,6 +426,7 @@ pub(crate) fn generate_erl_sources_with_roots(
             &dependency_module_exports,
             dependency_analysis.module_aliases.clone(),
             &resolved.imported_type_decls,
+            &resolved.imported_extern_types,
             &resolved.imported_field_indices,
             &resolved.imported_schemes,
         );
@@ -469,6 +476,7 @@ pub(crate) fn generate_erl_sources_with_roots(
         project_type,
         module_exports,
         module_type_decls,
+        module_extern_types,
         all_module_schemes,
         dependency_mods,
         module_aliases,

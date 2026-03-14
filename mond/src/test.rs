@@ -104,6 +104,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         manifest,
         module_exports,
         module_type_decls,
+        module_extern_types,
         all_module_schemes,
         dependency_mods,
         module_aliases,
@@ -132,6 +133,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let project = mondc::ProjectAnalysis {
         module_exports: all_exports.clone(),
         module_type_decls: module_type_decls.clone(),
+        module_extern_types: module_extern_types.clone(),
         all_module_schemes: all_module_schemes.clone(),
         module_aliases: module_aliases.clone(),
     };
@@ -149,6 +151,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &all_exports,
             resolved.module_aliases,
             &resolved.imported_type_decls,
+            &resolved.imported_extern_types,
             &resolved.imported_field_indices,
             &resolved.imported_schemes,
         );
@@ -231,6 +234,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &dependency_module_exports,
             dependency_analysis.module_aliases.clone(),
             &resolved.imported_type_decls,
+            &resolved.imported_extern_types,
             &resolved.imported_field_indices,
             &resolved.imported_schemes,
         );

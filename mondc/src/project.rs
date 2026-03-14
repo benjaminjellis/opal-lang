@@ -1,9 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 #[derive(Clone, Debug)]
 pub struct ProjectAnalysis {
     pub module_exports: HashMap<String, Vec<String>>,
     pub module_type_decls: HashMap<String, Vec<crate::ast::TypeDecl>>,
+    pub module_extern_types: HashMap<String, Vec<String>>,
     pub all_module_schemes: HashMap<String, crate::typecheck::TypeEnv>,
     pub module_aliases: HashMap<String, String>,
 }
@@ -14,6 +19,7 @@ pub struct ResolvedImports {
     pub import_origins: HashMap<String, String>,
     pub imported_schemes: crate::typecheck::TypeEnv,
     pub imported_type_decls: Vec<crate::ast::TypeDecl>,
+    pub imported_extern_types: Vec<String>,
     pub imported_field_indices: HashMap<String, usize>,
     pub module_aliases: HashMap<String, String>,
 }
@@ -22,31 +28,42 @@ pub fn build_project_analysis(
     std_mods: &[(String, String, String)],
     src_module_sources: &[(String, String)],
 ) -> Result<ProjectAnalysis, String> {
+    build_project_analysis_with_modules(std_mods, src_module_sources)
+}
+
+pub fn build_project_analysis_with_modules(
+    external_mods: &[(String, String, String)],
+    src_module_sources: &[(String, String)],
+) -> Result<ProjectAnalysis, String> {
     let mut module_exports = HashMap::new();
     let mut module_type_decls = HashMap::new();
+    let mut module_extern_types = HashMap::new();
 
-    for (user_name, _, source) in std_mods {
+    for (user_name, _, source) in external_mods {
         module_exports.insert(user_name.clone(), crate::exported_names(source));
         module_type_decls.insert(user_name.clone(), crate::exported_type_decls(source));
+        module_extern_types.insert(user_name.clone(), crate::exported_extern_types(source));
     }
     for (module_name, source) in src_module_sources {
         module_exports.insert(module_name.clone(), crate::exported_names(source));
         module_type_decls.insert(module_name.clone(), crate::exported_type_decls(source));
+        module_extern_types.insert(module_name.clone(), crate::exported_extern_types(source));
     }
 
-    let module_aliases: HashMap<String, String> = std_mods
+    let module_aliases: HashMap<String, String> = external_mods
         .iter()
         .map(|(user_name, erlang_name, _)| (user_name.clone(), erlang_name.clone()))
         .collect();
 
     let mut all_module_schemes: HashMap<String, crate::typecheck::TypeEnv> = HashMap::new();
-    for (user_name, _, source) in std_mods {
+    for (user_name, _, source) in external_mods {
         let imports = resolve_imports_for_source(
             source,
             &module_exports,
             &ProjectAnalysis {
                 module_exports: module_exports.clone(),
                 module_type_decls: module_type_decls.clone(),
+                module_extern_types: module_extern_types.clone(),
                 all_module_schemes: all_module_schemes.clone(),
                 module_aliases: module_aliases.clone(),
             },
@@ -70,6 +87,7 @@ pub fn build_project_analysis(
             &ProjectAnalysis {
                 module_exports: module_exports.clone(),
                 module_type_decls: module_type_decls.clone(),
+                module_extern_types: module_extern_types.clone(),
                 all_module_schemes: all_module_schemes.clone(),
                 module_aliases: module_aliases.clone(),
             },
@@ -88,6 +106,7 @@ pub fn build_project_analysis(
     Ok(ProjectAnalysis {
         module_exports,
         module_type_decls,
+        module_extern_types,
         all_module_schemes,
         module_aliases,
     })
@@ -109,6 +128,7 @@ pub fn alias_package_root_module(
 
     if analysis.module_exports.contains_key(package_name)
         || analysis.module_type_decls.contains_key(package_name)
+        || analysis.module_extern_types.contains_key(package_name)
         || analysis.all_module_schemes.contains_key(package_name)
     {
         return Err(format!(
@@ -123,6 +143,14 @@ pub fn alias_package_root_module(
         package_name.to_string(),
         analysis
             .module_type_decls
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    analysis.module_extern_types.insert(
+        package_name.to_string(),
+        analysis
+            .module_extern_types
             .get(LIB_MODULE_NAME)
             .cloned()
             .unwrap_or_default(),
@@ -151,8 +179,10 @@ pub fn resolve_imports_for_source(
     let mut import_origins = HashMap::new();
     let mut imported_schemes = HashMap::new();
     let mut imported_type_decls = Vec::new();
+    let mut imported_extern_types = Vec::new();
     let mut imported_field_indices: HashMap<String, usize> = HashMap::new();
     let mut imported_type_keys: HashSet<(String, String)> = HashSet::new();
+    let mut imported_extern_type_keys: HashSet<(String, String)> = HashSet::new();
 
     for (_, mod_name, unqualified) in crate::used_modules(source) {
         let erlang_name = project
@@ -229,6 +259,31 @@ pub fn resolve_imports_for_source(
                 }
             }
         }
+
+        if let Some(extern_types) = project.module_extern_types.get(&mod_name) {
+            match &unqualified {
+                crate::ast::UnqualifiedImports::None => {}
+                crate::ast::UnqualifiedImports::Wildcard => {
+                    for type_name in extern_types {
+                        let key = (mod_name.clone(), type_name.clone());
+                        if imported_extern_type_keys.insert(key) {
+                            imported_extern_types.push(type_name.clone());
+                        }
+                    }
+                }
+                crate::ast::UnqualifiedImports::Specific(names) => {
+                    for type_name in extern_types {
+                        if !names.iter().any(|name| name == type_name) {
+                            continue;
+                        }
+                        let key = (mod_name.clone(), type_name.clone());
+                        if imported_extern_type_keys.insert(key) {
+                            imported_extern_types.push(type_name.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     ResolvedImports {
@@ -236,6 +291,7 @@ pub fn resolve_imports_for_source(
         import_origins,
         imported_schemes,
         imported_type_decls,
+        imported_extern_types,
         imported_field_indices,
         module_aliases: project.module_aliases.clone(),
     }
@@ -314,6 +370,38 @@ pub fn std_modules_from_sources(
         .collect())
 }
 
+pub fn dependency_erlang_module_name(dep_name: &str, module_name: &str) -> String {
+    format!("d_{}_{}", sanitize_erlang_prefix(dep_name), module_name)
+}
+
+pub fn load_dependency_modules_from_checkout(
+    dep_name: &str,
+    checkout_dir: &Path,
+) -> Result<Vec<(String, String, String)>, String> {
+    let src_dir = checkout_dir.join("src");
+    if !src_dir.exists() {
+        return Err(format!(
+            "dependency `{dep_name}` is missing `src` at {}",
+            src_dir.display()
+        ));
+    }
+
+    let mut dep_sources: Vec<(String, String)> = Vec::new();
+    let mut lib_source: Option<String> = None;
+    collect_named_module_sources(&src_dir, &mut dep_sources, &mut lib_source)?;
+    if let Some(lib_src) = lib_source {
+        dep_sources.push((dep_name.to_string(), lib_src));
+    }
+
+    std_modules_from_sources(&dep_sources)?
+        .into_iter()
+        .map(|(user_name, _, source)| {
+            let erlang_name = dependency_erlang_module_name(dep_name, &user_name);
+            Ok((user_name, erlang_name, source))
+        })
+        .collect()
+}
+
 fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> Result<Vec<String>, String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mark {
@@ -361,6 +449,54 @@ fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> Result<Vec<String
     Ok(out)
 }
 
+fn sanitize_erlang_prefix(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() || sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        sanitized.insert(0, '_');
+    }
+    sanitized
+}
+
+fn collect_named_module_sources(
+    dir: &Path,
+    dep_sources: &mut Vec<(String, String)>,
+    lib_source: &mut Option<String>,
+) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_named_module_sources(&path, dep_sources, lib_source)?;
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("mond") {
+            continue;
+        }
+        let module_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let source = fs::read_to_string(&path)
+            .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+        if module_name == "lib" {
+            *lib_source = Some(source);
+        } else {
+            dep_sources.push((module_name, source));
+        }
+    }
+    Ok(())
+}
+
 fn local_module_graph(source_by_name: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
     let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (module_name, source) in source_by_name {
@@ -406,6 +542,19 @@ fn reachable_modules(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("mondc-project-test-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn ordered_module_sources_respects_dependencies() {
@@ -471,6 +620,33 @@ mod tests {
     }
 
     #[test]
+    fn load_dependency_modules_from_checkout_aliases_lib_to_package_name() {
+        let root = unique_temp_root();
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+        fs::write(src_dir.join("lib.mond"), "(pub let now {} 1)").expect("write lib");
+        fs::write(src_dir.join("duration.mond"), "(pub let seconds {} 1)").expect("write duration");
+
+        let modules =
+            load_dependency_modules_from_checkout("time", &root).expect("load dependency");
+
+        assert!(
+            modules
+                .iter()
+                .any(|(name, erl, _)| name == "time" && erl == "d_time_time"),
+            "expected aliased root module, got {modules:?}"
+        );
+        assert!(
+            modules
+                .iter()
+                .any(|(name, erl, _)| name == "duration" && erl == "d_time_duration"),
+            "expected submodule alias, got {modules:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resolve_imports_supports_root_and_submodule_imports() {
         let mut exports = HashMap::new();
         exports.insert("std".to_string(), vec!["hello".to_string()]);
@@ -486,6 +662,7 @@ mod tests {
             &ProjectAnalysis {
                 module_exports: exports.clone(),
                 module_type_decls: HashMap::new(),
+                module_extern_types: HashMap::new(),
                 all_module_schemes: HashMap::new(),
                 module_aliases,
             },
@@ -503,6 +680,7 @@ mod tests {
                 ("util".to_string(), vec!["helper".to_string()]),
             ]),
             module_type_decls: HashMap::new(),
+            module_extern_types: HashMap::new(),
             all_module_schemes: HashMap::new(),
             module_aliases: HashMap::new(),
         };
@@ -524,6 +702,7 @@ mod tests {
                 ("time".to_string(), vec!["from_time".to_string()]),
             ]),
             module_type_decls: HashMap::new(),
+            module_extern_types: HashMap::new(),
             all_module_schemes: HashMap::new(),
             module_aliases: HashMap::new(),
         };

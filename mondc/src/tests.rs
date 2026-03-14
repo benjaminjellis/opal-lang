@@ -40,6 +40,7 @@ fn qualified_std_call_requires_use() {
         &module_exports,
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -53,6 +54,7 @@ fn qualified_std_call_requires_use() {
         HashMap::new(),
         &module_exports,
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -75,6 +77,7 @@ fn duplicate_unqualified_imports_error() {
         &module_exports,
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -91,6 +94,7 @@ fn duplicate_top_level_function_defs_error() {
         HashMap::new(),
         &HashMap::new(),
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -109,6 +113,7 @@ fn duplicate_record_fields_error() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -125,6 +130,7 @@ fn duplicate_variant_constructors_error() {
         HashMap::new(),
         &HashMap::new(),
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -146,6 +152,7 @@ fn duplicate_variant_constructors_across_types_error() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -165,6 +172,7 @@ fn top_level_function_conflicts_with_unqualified_import() {
         HashMap::new(),
         &module_exports,
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -186,6 +194,7 @@ fn top_level_function_does_not_conflict_with_qualified_only_import() {
         &module_exports,
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -205,6 +214,7 @@ fn duplicate_module_use_without_unqualified_imports_is_allowed() {
         HashMap::new(),
         &module_exports,
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -232,6 +242,7 @@ fn qualified_only_use_does_not_import_variant_constructors_unqualified() {
         &analysis.module_exports,
         resolved.module_aliases,
         &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
         &resolved.imported_field_indices,
         &resolved.imported_schemes,
     );
@@ -270,6 +281,7 @@ fn importing_type_name_brings_variant_constructors_into_scope() {
         &analysis.module_exports,
         resolved.module_aliases,
         &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
         &resolved.imported_field_indices,
         &resolved.imported_schemes,
     );
@@ -303,6 +315,7 @@ fn qualified_only_use_keeps_record_field_accessors_available() {
         &analysis.module_exports,
         resolved.module_aliases,
         &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
         &resolved.imported_field_indices,
         &resolved.imported_schemes,
     );
@@ -327,6 +340,7 @@ fn extern_signature_reports_unknown_type_without_type_import() {
         HashMap::new(),
         &HashMap::new(),
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -359,12 +373,139 @@ fn extern_signature_accepts_type_imported_unqualified() {
         &module_exports,
         HashMap::new(),
         &imported_type_decls,
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
     assert!(
         !report.has_errors(),
         "unexpected diagnostics: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn type_declaration_accepts_imported_extern_type() {
+    let unknown_src = "(pub extern type Unknown)";
+    let std_mods = vec![(
+        "unknown".to_string(),
+        "mond_unknown".to_string(),
+        unknown_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = r#"
+        (use unknown [Unknown])
+        (pub extern type Pid)
+        (pub type SubjectPayload [(:owner ~ Pid) (:tag ~ Unknown)])
+    "#;
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "process",
+        src,
+        "process.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
+        &resolved.imported_field_indices,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn type_declaration_reports_unknown_type_without_import() {
+    let src = "(pub type Next [Continue (Stop ~ ExitReason)])";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(report.has_errors());
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unknown type") && m.contains("ExitReason")),
+        "expected unknown type declaration diagnostic, got: {messages:?}"
+    );
+}
+
+#[test]
+fn type_declaration_reports_missing_type_arguments() {
+    let src = "(type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])\n(pub type ['s 'm] Next [(Continue ~ ContinuePayload)])";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(report.has_errors());
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages.iter().any(|m| {
+            m.contains("wrong number of type arguments for `ContinuePayload`")
+                && m.contains("expected 2, found 0")
+        }),
+        "expected type argument arity diagnostic, got: {messages:?}"
+    );
+}
+
+#[test]
+fn type_declaration_accepts_nested_type_application() {
+    let src = "(type ['a] Option [None (Some ~ 'a)])\n\
+               (pub extern type ['p] Selector)\n\
+               (type ['m] ContinuePayload [(:select ~ (Selector (Option 'm)))])\n\
+               (let main {} ())";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(
+        !report.has_errors(),
+        "expected nested type application to compile, got diagnostics: {:?}",
         report
             .diagnostics
             .iter()
@@ -389,6 +530,7 @@ fn wildcard_import_enables_unqualified_call() {
         &module_exports,
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -410,6 +552,7 @@ fn local_shadowing_beats_unqualified_import() {
         imports,
         &module_exports,
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -560,6 +703,7 @@ fn imported_result_bind_reports_continuation_mismatch() {
         &module_exports,
         HashMap::new(),
         &imported_type_decls,
+        &[],
         &HashMap::new(),
         &imported_schemes,
     );
@@ -666,6 +810,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
         &module_exports,
         HashMap::new(),
         &imported_type_decls,
+        &[],
         &HashMap::new(),
         &imported_schemes,
     );
@@ -700,6 +845,7 @@ fn session_can_suppress_warning_emission() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -722,6 +868,7 @@ fn session_still_emits_errors_when_warnings_disabled() {
         HashMap::new(),
         &HashMap::new(),
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -797,6 +944,7 @@ fn compile_emits_unused_local_binding_warning() {
         &HashMap::new(),
         HashMap::new(),
         &[],
+        &[],
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -807,6 +955,37 @@ fn compile_emits_unused_local_binding_warning() {
             .iter()
             .any(|m| m.contains("unused local binding `y`")),
         "missing unused local warning: {messages:?}"
+    );
+}
+
+#[test]
+fn compile_emits_unused_type_parameter_warning() {
+    let src = "(type ['s 'm] Box [(:value ~ Int)])\n(let main {} ())";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    let messages: Vec<String> = report.diagnostics.into_iter().map(|d| d.message).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unused type parameter `'s` in type `Box`")),
+        "missing unused type parameter warning for 's: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unused type parameter `'m` in type `Box`")),
+        "missing unused type parameter warning for 'm: {messages:?}"
     );
 }
 
@@ -907,6 +1086,7 @@ fn compile_report_emits_redundant_match_warning() {
         HashMap::new(),
         &HashMap::new(),
         HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
         &HashMap::new(),
@@ -1131,6 +1311,48 @@ fn unused_type_analysis_counts_variant_constructor_usage() {
     assert!(
         warnings::unused_type_spans(&decls).is_empty(),
         "expected type to be considered used via constructor"
+    );
+}
+
+#[test]
+fn unused_type_param_analysis_marks_variant_params_not_referenced() {
+    let src = "(type ['s 'm] Next [(Continue ~ ContinuePayload) (Stop ~ ExitReason)])";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut unused: Vec<(String, String)> = warnings::unused_type_param_spans(&decls)
+        .into_iter()
+        .map(|(type_name, param, _)| (type_name, param))
+        .collect();
+    unused.sort();
+    assert_eq!(
+        unused,
+        vec![
+            ("Next".to_string(), "'m".to_string()),
+            ("Next".to_string(), "'s".to_string())
+        ]
+    );
+}
+
+#[test]
+fn unused_type_param_analysis_ignores_referenced_params() {
+    let src = "(type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm) (Stop ~ ExitReason)])";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    assert!(
+        warnings::unused_type_param_spans(&decls).is_empty(),
+        "expected referenced type params to avoid warnings"
     );
 }
 
