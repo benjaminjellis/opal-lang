@@ -775,6 +775,7 @@ fn binary_op(name: &str) -> Option<&'static str> {
         "-" => Some("-"),
         "*" => Some("*"),
         "/" => Some("div"),
+        "%" => Some("rem"),
         "+." => Some("+"),
         "-." => Some("-"),
         "*." => Some("*"),
@@ -1082,6 +1083,18 @@ mod tests {
         assert!(
             erl.contains("fun(A__) -> fun(B__) -> (A__ orelse B__) end end"),
             "expected first-class builtin operator lowering:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn int_modulo_lowers_to_erlang_rem() {
+        let src = r#"
+(let mod_two {x} (% x 2))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains(" rem "),
+            "expected `%` to lower to Erlang rem:\n{erl}"
         );
     }
 

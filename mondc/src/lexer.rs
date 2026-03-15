@@ -5,6 +5,14 @@ pub struct Lexer<'a> {
     source: &'a str,
 }
 
+fn parse_float_literal(lex: &mut logos::Lexer<TokenKind>) -> Option<f64> {
+    lex.slice().replace('_', "").parse::<f64>().ok()
+}
+
+fn parse_int_literal(lex: &mut logos::Lexer<TokenKind>) -> Option<i64> {
+    lex.slice().replace('_', "").parse::<i64>().ok()
+}
+
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
         Self { source }
@@ -93,11 +101,12 @@ pub enum TokenKind {
     #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
     NamedField(String),
 
-    #[regex(r"-?[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
-    // Matches 3.14, -0.5, etc.
+    #[regex(r"-?[0-9](?:_?[0-9])*\.[0-9](?:_?[0-9])*", parse_float_literal)]
+    // Matches 3.14, -0.5, 1_000.25, 12_345.67_89, etc.
     Float(f64),
 
-    #[regex(r"-?[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
+    #[regex(r"-?[0-9](?:_?[0-9])*", parse_int_literal)]
+    // Matches 42, -10, 1_000_000, etc.
     Int(i64),
 
     // Generics (e.g., 'a, 'e)
@@ -128,7 +137,7 @@ pub enum TokenKind {
 
     // Operators
     // Includes '.' so that float ops like +. -. *. /. lex as a single token
-    #[regex(r"[\+\-\*/=<>!&|\.]+")]
+    #[regex(r"[\+\-\*/%=<>!&|\.]+")]
     Operator,
 
     #[token("error")]
@@ -273,6 +282,14 @@ mod tests {
     }
 
     #[test]
+    fn int_literal_with_underscores() {
+        let source = "1_000_000 -2_500";
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+        assert_eq!(tokens, vec![Int(1_000_000), Int(-2_500)]);
+    }
+
+    #[test]
     fn float() {
         let expected_tokens = [
             LRound,
@@ -305,6 +322,14 @@ mod tests {
         let lexer = TokenKind::lexer(source);
         let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
         assert_eq!(tokens, vec![Float(-0.5)]);
+    }
+
+    #[test]
+    fn float_literal_with_underscores() {
+        let source = "1_234.5_6 -10_000.25";
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+        assert_eq!(tokens, vec![Float(1_234.56), Float(-10_000.25)]);
     }
 
     #[test]
@@ -525,12 +550,14 @@ mod tests {
     #[test]
     fn comparison_operators() {
         // All operator tokens — they're all TokenKind::Operator
-        let source = "= != < > <= >=";
+        let source = "= != < > <= >= %";
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
         assert_eq!(
             tokens,
-            vec![Operator, Operator, Operator, Operator, Operator, Operator]
+            vec![
+                Operator, Operator, Operator, Operator, Operator, Operator, Operator,
+            ]
         );
     }
 

@@ -1975,7 +1975,7 @@ pub fn primitive_env() -> TypeEnv {
     };
 
     // Arithmetic — Int
-    for op in ["+", "-", "*", "/"] {
+    for op in ["+", "-", "*", "/", "%"] {
         env.insert(op.to_string(), fun2(Type::int(), Type::int(), Type::int()));
     }
     // Arithmetic — Float
@@ -3064,6 +3064,12 @@ mod tests {
     }
 
     #[test]
+    fn infer_int_modulo() {
+        let ty = check_expr("(% 7 3)").unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
     fn infer_inequality_operator() {
         let ty = check_expr("(!= 1 2)").unwrap();
         assert_eq!(ty, Type::bool());
@@ -3211,7 +3217,7 @@ mod tests {
             (type TrafficLight [Red Yellow Green])
             (let to_int {light}
               (match light
-                Red or Yellow ~> 0
+                Red | Yellow ~> 0
                 Green ~> 1))
             (let main {} (to_int Red))
         "#;
@@ -3279,7 +3285,7 @@ mod tests {
 
     #[test]
     fn accept_exhaustive_bool_match_with_or_pattern() {
-        let ty = check_expr("(match True True or False ~> 1)").unwrap();
+        let ty = check_expr("(match True True | False ~> 1)").unwrap();
         assert_eq!(ty, Type::int());
     }
 
@@ -3364,6 +3370,15 @@ mod tests {
     }
 
     #[test]
+    fn reject_int_modulo_with_float() {
+        let result = check_expr("(% 7.0 2)");
+        assert!(
+            result.is_err(),
+            "expected type error: Float used with int modulo"
+        );
+    }
+
+    #[test]
     fn reject_int_comparison_with_float() {
         // Comparison operators are Int-only
         let result = check_expr("(< 1.0 2.0)");
@@ -3430,7 +3445,7 @@ mod tests {
     #[test]
     fn infer_or_pattern_match() {
         // All alternatives are Int literals; result is Bool
-        let src = "(let pred {x} (match x 1 or 2 or 3 ~> True _ ~> False))\n(let main {} (pred 1))";
+        let src = "(let pred {x} (match x 1 | 2 | 3 ~> True _ ~> False))\n(let main {} (pred 1))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::bool());
     }
@@ -3439,7 +3454,7 @@ mod tests {
     fn reject_or_pattern_type_mismatch() {
         // or-pattern alternatives must agree with the target type; 1 is Int, True is Bool
         let result =
-            check("(let pred {x} (match x 1 or True ~> 0 _ ~> 1))\n(let main {} (pred 1))");
+            check("(let pred {x} (match x 1 | True ~> 0 _ ~> 1))\n(let main {} (pred 1))");
         assert!(
             result.is_err(),
             "expected type error: Int vs Bool in or-pattern"
@@ -3498,6 +3513,22 @@ mod tests {
         let src = "(let first {lst} (match lst [] ~> 0 [h | _] ~> h))\n(let main {} (first [5]))";
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_singleton_list_pattern_sugar() {
+        // `[x]` is sugar for `[x | []]`
+        let src = "(let only_singleton {lst} (match lst [x] ~> x _ ~> 0))\n(let main {} (only_singleton [5]))";
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_multi_head_cons_pattern_sugar() {
+        // `[a b | rest]` is sugar for `[a | [b | rest]]`
+        let src = "(let drop_two {lst} (match lst [a b | rest] ~> rest _ ~> []))\n(let main {} (drop_two [1 2 3]))";
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::array(Type::int()));
     }
 
     #[test]

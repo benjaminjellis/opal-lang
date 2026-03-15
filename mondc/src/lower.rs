@@ -1828,10 +1828,11 @@ impl Lowerer {
         let first_arrow_abs = first_arrow + 1;
 
         // items[1..first_arrow_abs] are targets + first-arm patterns.
-        // Detect or-patterns: if any 'or' token appears before the first arrow, single-target mode.
+        // Detect or-patterns: if any match-alternative separator appears
+        // before the first arrow, single-target mode.
         let has_or = items[1..first_arrow_abs]
             .iter()
-            .any(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Or)));
+            .any(|s| self.is_match_alt_separator(file_id, s));
 
         let n_targets = if has_or {
             1
@@ -1878,16 +1879,16 @@ impl Lowerer {
                 let pat = self.lower_pattern(file_id, &items[cursor])?;
                 cursor += 1;
 
-                // In single-target mode, collect 'or'-separated alternatives.
+                // In single-target mode, collect `|`-separated alternatives.
                 let final_pat = if n_targets == 1 {
                     let mut or_pats = vec![pat];
                     while let Some(SExpr::Atom(t)) = items.get(cursor) {
-                        if matches!(t.kind, TokenKind::Or) {
-                            cursor += 1; // consume 'or'
+                        if self.is_match_alt_separator(file_id, &items[cursor]) {
+                            cursor += 1; // consume separator
                             if cursor >= items.len() {
                                 self.error(
                                     Diagnostic::error()
-                                        .with_message("expected a pattern after 'or'")
+                                        .with_message("expected a pattern after '|'")
                                         .with_labels(vec![Label::primary(file_id, t.span.clone())]),
                                 );
                                 return None;
@@ -1978,6 +1979,15 @@ impl Lowerer {
             arms,
             span,
         })
+    }
+
+    fn is_match_alt_separator(&self, file_id: usize, sexpr: &SExpr) -> bool {
+        let SExpr::Atom(token) = sexpr else {
+            return false;
+        };
+        matches!(token.kind, TokenKind::Or)
+            || (matches!(token.kind, TokenKind::Operator)
+                && self.source_at(file_id, token.span.clone()) == "|")
     }
 
     fn lower_pattern(&mut self, file_id: usize, sexpr: &SExpr) -> Option<Pattern> {
@@ -2091,37 +2101,65 @@ impl Lowerer {
                 None
             }
 
-            // `[]` — empty list, `[h | t]` — cons pattern
+            // List patterns:
+            // - `[]`            => empty list
+            // - `[h | t]`       => cons
+            // - `[a b c]`       => sugar for `[a | [b | [c | []]]]`
+            // - `[a b | tail]`  => sugar for `[a | [b | tail]]`
             SExpr::Square(items, span) => {
                 if items.is_empty() {
                     return Some(Pattern::EmptyList(span.clone()));
                 }
-                // Find the `|` operator that separates head from tail
-                let pipe_pos = items.iter().position(|item| {
-                    if let SExpr::Atom(t) = item
-                        && t.kind == TokenKind::Operator
-                    {
-                        return self.source_at(file_id, t.span.clone()) == "|";
+                // Find all `|` separators, if any.
+                let pipe_positions: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, item)| {
+                        if let SExpr::Atom(t) = item
+                            && t.kind == TokenKind::Operator
+                            && self.source_at(file_id, t.span.clone()) == "|"
+                        {
+                            return Some(idx);
+                        }
+                        None
+                    })
+                    .collect();
+
+                match pipe_positions.as_slice() {
+                    // `[a b c]` -> `[a | [b | [c | []]]]`
+                    [] => {
+                        let mut acc = Pattern::EmptyList(span.clone());
+                        for head_expr in items.iter().rev() {
+                            let head = self.lower_pattern(file_id, head_expr)?;
+                            acc = Pattern::Cons(Box::new(head), Box::new(acc), span.clone());
+                        }
+                        Some(acc)
                     }
-                    false
-                });
-                match pipe_pos {
-                    Some(pos) if pos == 1 && items.len() == 3 => {
-                        let head = self.lower_pattern(file_id, &items[0])?;
-                        let tail = self.lower_pattern(file_id, &items[2])?;
-                        Some(Pattern::Cons(Box::new(head), Box::new(tail), span.clone()))
+
+                    // `[h1 h2 ... | tail]`
+                    [pipe_pos] if *pipe_pos > 0 && (*pipe_pos + 2) == items.len() => {
+                        let heads = &items[..*pipe_pos];
+                        let tail = self.lower_pattern(file_id, &items[*pipe_pos + 1])?;
+                        let mut acc = tail;
+                        for head_expr in heads.iter().rev() {
+                            let head = self.lower_pattern(file_id, head_expr)?;
+                            acc = Pattern::Cons(Box::new(head), Box::new(acc), span.clone());
+                        }
+                        Some(acc)
                     }
+
                     _ => {
                         self.error(
                             Diagnostic::error()
                                 .with_code("E005")
                                 .with_message("invalid list pattern")
                                 .with_labels(vec![
-                                    Label::primary(file_id, span.clone())
-                                        .with_message("expected `[]` or `[head | tail]`"),
+                                    Label::primary(file_id, span.clone()).with_message(
+                                        "expected `[]`, `[h1 ... hn]`, or `[h1 ... hn | tail]`",
+                                    ),
                                 ])
                                 .with_notes(vec![
-                                    "hint: list patterns are `[]` (empty) or `[h | t]` (cons)"
+                                    "hint: examples: `[x]`, `[x y]`, `[h | t]`, `[h1 h2 | t]`"
                                         .into(),
                                 ]),
                         );
@@ -3414,13 +3452,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_singleton_list_pattern_lowers_to_cons_empty() {
+        let src = "(match xs [t] ~> t)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Expr::Match { arms, .. } = expr {
+            match &arms[0].0[0] {
+                Pattern::Cons(head, tail, _) => {
+                    assert!(matches!(head.as_ref(), Pattern::Variable(name, _) if name == "t"));
+                    assert!(matches!(tail.as_ref(), Pattern::EmptyList(_)));
+                }
+                other => panic!("expected cons pattern, got {other:?}"),
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn test_multi_head_list_cons_pattern_lowers_to_nested_cons() {
+        let src = "(match xs [h t | rest] ~> rest)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Expr::Match { arms, .. } = expr {
+            match &arms[0].0[0] {
+                Pattern::Cons(first_head, first_tail, _) => {
+                    assert!(
+                        matches!(first_head.as_ref(), Pattern::Variable(name, _) if name == "h")
+                    );
+                    match first_tail.as_ref() {
+                        Pattern::Cons(second_head, second_tail, _) => {
+                            assert!(
+                                matches!(second_head.as_ref(), Pattern::Variable(name, _) if name == "t")
+                            );
+                            assert!(
+                                matches!(second_tail.as_ref(), Pattern::Variable(name, _) if name == "rest")
+                            );
+                        }
+                        other => panic!("expected nested cons tail, got {other:?}"),
+                    }
+                }
+                other => panic!("expected cons pattern, got {other:?}"),
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Or-pattern and multi-target match tests
     // -------------------------------------------------------------------------
 
     #[test]
     fn test_or_pattern_lowers_to_pattern_or() {
-        let src = "(match x 1 or 2 or 3 ~> True _ ~> False)";
+        let src = "(match x 1 | 2 | 3 ~> True _ ~> False)";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let expr = lowerer
             .lower_expr(file_id, &sexprs[0])
