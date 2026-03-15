@@ -355,29 +355,12 @@ fn fmt_let_bindings(bindings: &[SExpr], source: &str) -> Doc {
         return text("[]");
     }
 
-    // Compute max name width so values align across all pairs.
-    let name_width: usize = bindings
-        .chunks(2)
-        .filter_map(|chunk| chunk.first())
-        .map(|s| match s {
-            SExpr::Atom(t) => source[t.span.clone()].len(),
-            _ => 0,
-        })
-        .max()
-        .unwrap_or(0);
-
     let mut pairs: Vec<Doc> = Vec::new();
     let mut i = 0;
     while i + 1 < bindings.len() {
-        let name_sexpr = &bindings[i];
-        let name_len = match name_sexpr {
-            SExpr::Atom(t) => source[t.span.clone()].len(),
-            _ => 0,
-        };
-        let name_doc = fmt(name_sexpr, source);
+        let name_doc = fmt(&bindings[i], source);
         let val_doc = fmt(&bindings[i + 1], source);
-        let padding = " ".repeat(name_width - name_len + 1);
-        pairs.push(concat_all([name_doc, text(padding), val_doc]));
+        pairs.push(concat_all([name_doc, text(" "), val_doc]));
         i += 2;
     }
     if i < bindings.len() {
@@ -641,6 +624,19 @@ fn fmt_generic(items: &[SExpr], source: &str) -> Doc {
     if items.len() == 1 {
         return concat_all([text("("), head, text(")")]);
     }
+
+    // Keep single-arg lambda calls tight: `(spawn (f {...} -> ...))`
+    // and let wrapping happen inside the lambda body.
+    if items.len() == 2 && is_lambda_expr(&items[1]) {
+        return group(concat_all([
+            text("("),
+            head,
+            text(" "),
+            fmt(&items[1], source),
+            text(")"),
+        ]));
+    }
+
     let args: Vec<Doc> = items[1..].iter().map(|s| fmt(s, source)).collect();
     let args_doc = join(line(), args);
     group(concat_all([
@@ -649,6 +645,16 @@ fn fmt_generic(items: &[SExpr], source: &str) -> Doc {
         nest(2, concat(line(), args_doc)),
         text(")"),
     ]))
+}
+
+fn is_lambda_expr(expr: &SExpr) -> bool {
+    let SExpr::Round(items, _) = expr else {
+        return false;
+    };
+    matches!(
+        items.first(),
+        Some(SExpr::Atom(token)) if token.kind == TokenKind::Fn
+    )
 }
 
 fn fmt_generic_with_head(kw: &str, rest: &[SExpr], source: &str) -> Doc {

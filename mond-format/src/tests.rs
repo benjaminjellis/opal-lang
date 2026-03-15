@@ -213,6 +213,20 @@ fn call_breaks_when_long() {
 }
 
 #[test]
+fn single_arg_lambda_call_stays_tight() {
+    let src = r#"(let main {}
+  (process/spawn
+    (f {_} ->
+      (do (process/sleep 10)
+          ()))))"#;
+    let out = format(src, 80);
+    assert!(
+        out.contains("(process/spawn (f {_} ->"),
+        "expected lambda argument to stay on same line as callee:\n{out}"
+    );
+}
+
+#[test]
 fn record_constructor_keeps_named_field_pairs_together_when_wrapped() {
     let src = "(pub let selecting {initialised selector} (Initalised :state (:state initialised) :selector selector :return (:return initialised)))";
     let out = format(src, 40);
@@ -420,6 +434,24 @@ fn do_in_match_arm() {
     let out2 = format(&out, 80);
     assert_eq!(out, out2, "formatter is not idempotent");
     assert!(out.contains("(do ("), "do should keep first expr inline");
+}
+
+#[test]
+fn let_bindings_do_not_pad_short_names() {
+    let src = r#"(test
+  "process/subject send and receive_timeout"
+  (let [subject (process/new_subject)
+        _       (process/spawn
+          (f {_} ->
+            (do (process/sleep 10)
+                (process/send subject "pong")
+                ())))]
+    (assert_eq (process/receive_timeout subject 1000) (Ok "pong"))))"#;
+    let out = format(src, 80);
+    assert!(
+        out.contains("\n        _ (process/spawn"),
+        "expected single space after short binding names:\n{out}"
+    );
 }
 
 #[test]
