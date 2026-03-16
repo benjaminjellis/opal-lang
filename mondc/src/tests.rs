@@ -410,13 +410,24 @@ fn field_access_uses_the_record_type_not_just_field_name() {
         &HashMap::new(),
     );
     assert!(
-        !report.has_errors(),
-        "field access should be disambiguated by record type: {:?}",
+        report.has_errors(),
+        "expected ambiguous field access to be rejected: {:?}",
         report
             .diagnostics
             .iter()
             .map(|d| d.message.clone())
             .collect::<Vec<_>>()
+    );
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("ambiguous field access `:state`")),
+        "expected ambiguity diagnostic for :state, got: {messages:?}"
     );
 }
 

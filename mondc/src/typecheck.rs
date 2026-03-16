@@ -111,6 +111,12 @@ pub enum TypeError {
         /// The file and span of the type definition, if known
         def: Option<(usize, std::ops::Range<usize>)>,
     },
+    AmbiguousFieldAccess {
+        field: String,
+        record_ty: Rc<Type>,
+        field_span: std::ops::Range<usize>,
+        candidates: Vec<String>,
+    },
     DuplicateRecordField {
         record: String,
         field: String,
@@ -335,6 +341,29 @@ impl TypeError {
                     );
                 }
                 diags
+            }
+            TypeError::AmbiguousFieldAccess {
+                field,
+                record_ty,
+                field_span,
+                candidates,
+            } => {
+                let ty_s = type_display(record_ty);
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!(
+                            "ambiguous field access `:{field}` for `{ty_s}`"
+                        ))
+                        .with_labels(vec![
+                            Label::primary(file_id, field_span.clone()).with_message(format!(
+                                "cannot determine which record accessor for `:{field}` to use"
+                            )),
+                        ])
+                        .with_notes(vec![
+                            format!("candidates: {}", candidates.join(", ")),
+                            "add a type constraint (for example via pattern matching) before accessing this field".into(),
+                        ]),
+                ]
             }
             TypeError::DuplicateRecordField {
                 record,
@@ -1240,14 +1269,48 @@ impl TypeChecker {
                             })?
                     }
                 } else {
-                    let accessor_name = format!(":{field}");
-                    env.get(&accessor_name)
-                        .ok_or_else(|| TypeError::UnknownField {
-                            field: field.clone(),
-                            record_ty: resolved_record.clone(),
-                            field_span: span.clone(),
-                            def: None,
-                        })?
+                    // When the record type is not yet known, only use a plain accessor if it is
+                    // unambiguous across all known records. Otherwise we may incorrectly lock onto
+                    // whichever declaration happened to be seen first.
+                    let mut candidates: Vec<String> = self
+                        .record_fields
+                        .iter()
+                        .filter_map(|(name, fields)| {
+                            if fields.iter().any(|declared| declared == field) {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    candidates.sort();
+                    match candidates.as_slice() {
+                        [] => {
+                            let accessor_name = format!(":{field}");
+                            env.get(&accessor_name)
+                                .ok_or_else(|| TypeError::UnknownField {
+                                    field: field.clone(),
+                                    record_ty: resolved_record.clone(),
+                                    field_span: span.clone(),
+                                    def: None,
+                                })?
+                        }
+                        [record_name] => lookup_record_accessor(env, record_name, field)
+                            .ok_or_else(|| TypeError::UnknownField {
+                                field: field.clone(),
+                                record_ty: resolved_record.clone(),
+                                field_span: span.clone(),
+                                def: self.type_def_spans.get(record_name).cloned(),
+                            })?,
+                        _ => {
+                            return Err(TypeError::AmbiguousFieldAccess {
+                                field: field.clone(),
+                                record_ty: resolved_record.clone(),
+                                field_span: span.clone(),
+                                candidates,
+                            });
+                        }
+                    }
                 };
                 let accessor_ty = self.instantiate(scheme);
 
@@ -2858,6 +2921,27 @@ mod tests {
         "#;
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn reject_ambiguous_field_access_on_unconstrained_record() {
+        let src = r#"
+            (type ContinuePayload [(:selector ~ Int)])
+            (type Initialised [(:selector ~ Bool)])
+            (let read_selector {x} (:selector x))
+            (let main {} (read_selector (ContinuePayload :selector 1)))
+        "#;
+        let result = check(src);
+        assert!(
+            matches!(
+                result,
+                Err(TypeError::AmbiguousFieldAccess { ref field, ref candidates, .. })
+                    if field == "selector"
+                        && candidates.contains(&"ContinuePayload".to_string())
+                        && candidates.contains(&"Initialised".to_string())
+            ),
+            "expected AmbiguousFieldAccess for :selector, got {result:?}"
+        );
     }
 
     #[test]
