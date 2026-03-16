@@ -50,11 +50,22 @@ impl Type {
 #[derive(Debug, Clone)]
 pub struct Scheme {
     pub vars: Vec<u64>,
+    pub preds: Vec<Predicate>,
     pub ty: Rc<Type>,
 }
 
 pub type Substitution = HashMap<u64, Rc<Type>>;
 pub type TypeEnv = HashMap<String, Scheme>;
+
+/// Type predicates used for constrained polymorphism.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Predicate {
+    HasField {
+        label: String,
+        record_ty: Rc<Type>,
+        field_ty: Rc<Type>,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // Error Handling
@@ -115,6 +126,18 @@ pub enum TypeError {
         field: String,
         record_ty: Rc<Type>,
         field_span: std::ops::Range<usize>,
+        candidates: Vec<String>,
+    },
+    UnsatisfiedFieldConstraint {
+        field: String,
+        record_ty: Rc<Type>,
+        field_ty: Rc<Type>,
+        candidates: Vec<String>,
+    },
+    AmbiguousFieldConstraint {
+        field: String,
+        record_ty: Rc<Type>,
+        field_ty: Rc<Type>,
         candidates: Vec<String>,
     },
     DuplicateRecordField {
@@ -365,6 +388,67 @@ impl TypeError {
                         ]),
                 ]
             }
+            TypeError::UnsatisfiedFieldConstraint {
+                field,
+                record_ty,
+                field_ty,
+                candidates,
+            } => {
+                let mut var_names = std::collections::HashMap::new();
+                let constraint_s = predicate_display_inner(
+                    &Predicate::HasField {
+                        label: field.clone(),
+                        record_ty: record_ty.clone(),
+                        field_ty: field_ty.clone(),
+                    },
+                    &mut var_names,
+                );
+                let mut notes = if candidates.is_empty() {
+                    vec![format!("no record type in scope defines `:{field}`")]
+                } else {
+                    vec![format!(
+                        "records with `:{field}`: {}",
+                        candidates.join(", ")
+                    )]
+                };
+                notes.push("add a type constraint so the record type is known".into());
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!("unsatisfied field constraint `{constraint_s}`"))
+                        .with_labels(vec![Label::primary(file_id, span).with_message(
+                            "this expression requires a record field that cannot be resolved",
+                        )])
+                        .with_notes(notes),
+                ]
+            }
+            TypeError::AmbiguousFieldConstraint {
+                field,
+                record_ty,
+                field_ty,
+                candidates,
+            } => {
+                let mut var_names = std::collections::HashMap::new();
+                let constraint_s = predicate_display_inner(
+                    &Predicate::HasField {
+                        label: field.clone(),
+                        record_ty: record_ty.clone(),
+                        field_ty: field_ty.clone(),
+                    },
+                    &mut var_names,
+                );
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!("ambiguous field constraint `{constraint_s}`"))
+                        .with_labels(vec![
+                            Label::primary(file_id, span)
+                                .with_message("the record type is still polymorphic here"),
+                        ])
+                        .with_notes(vec![
+                            format!("candidate records: {}", candidates.join(", ")),
+                            "add a concrete record type constraint before using this value".into(),
+                        ]),
+                ]
+            }
             TypeError::DuplicateRecordField {
                 record,
                 field,
@@ -438,6 +522,44 @@ pub fn type_display(ty: &Type) -> String {
     type_display_inner(ty, &mut var_names)
 }
 
+pub fn predicate_display(pred: &Predicate) -> String {
+    let mut var_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    predicate_display_inner(pred, &mut var_names)
+}
+
+pub fn scheme_display(scheme: &Scheme) -> String {
+    let mut var_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let ty = type_display_inner(&scheme.ty, &mut var_names);
+    if scheme.preds.is_empty() {
+        ty
+    } else {
+        let preds = scheme
+            .preds
+            .iter()
+            .map(|pred| predicate_display_inner(pred, &mut var_names))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{preds} => {ty}")
+    }
+}
+
+fn predicate_display_inner(
+    pred: &Predicate,
+    var_names: &mut std::collections::HashMap<u64, String>,
+) -> String {
+    match pred {
+        Predicate::HasField {
+            label,
+            record_ty,
+            field_ty,
+        } => format!(
+            "HasField :{label} {} {}",
+            type_display_inner(record_ty, var_names),
+            type_display_inner(field_ty, var_names)
+        ),
+    }
+}
+
 fn type_display_inner(ty: &Type, var_names: &mut std::collections::HashMap<u64, String>) -> String {
     match ty {
         Type::Con(name, args) if args.is_empty() => name.clone(),
@@ -500,6 +622,27 @@ pub fn apply_subst(subst: &Substitution, ty: &Rc<Type>) -> Rc<Type> {
     }
 }
 
+fn apply_subst_predicate(subst: &Substitution, pred: &Predicate) -> Predicate {
+    match pred {
+        Predicate::HasField {
+            label,
+            record_ty,
+            field_ty,
+        } => Predicate::HasField {
+            label: label.clone(),
+            record_ty: apply_subst(subst, record_ty),
+            field_ty: apply_subst(subst, field_ty),
+        },
+    }
+}
+
+fn apply_subst_preds(subst: &Substitution, preds: &[Predicate]) -> Vec<Predicate> {
+    preds
+        .iter()
+        .map(|pred| apply_subst_predicate(subst, pred))
+        .collect()
+}
+
 fn apply_subst_scheme(subst: &Substitution, scheme: &Scheme) -> Scheme {
     let reduced: Substitution = subst
         .iter()
@@ -508,6 +651,11 @@ fn apply_subst_scheme(subst: &Substitution, scheme: &Scheme) -> Scheme {
         .collect();
     Scheme {
         vars: scheme.vars.clone(),
+        preds: scheme
+            .preds
+            .iter()
+            .map(|pred| apply_subst_predicate(&reduced, pred))
+            .collect(),
         ty: apply_subst(&reduced, &scheme.ty),
     }
 }
@@ -545,14 +693,36 @@ fn free_vars(ty: &Type) -> HashSet<u64> {
     }
 }
 
-fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
+fn free_vars_predicate(pred: &Predicate) -> HashSet<u64> {
+    match pred {
+        Predicate::HasField {
+            record_ty,
+            field_ty,
+            ..
+        } => {
+            let mut fv = free_vars(record_ty);
+            fv.extend(free_vars(field_ty));
+            fv
+        }
+    }
+}
+
+fn free_vars_preds(preds: &[Predicate]) -> HashSet<u64> {
+    preds
+        .iter()
+        .flat_map(free_vars_predicate)
+        .collect::<HashSet<_>>()
+}
+
+fn generalize(env: &TypeEnv, ty: &Rc<Type>, preds: &[Predicate]) -> Scheme {
     const GENERALIZED_VAR_BASE: u64 = u64::MAX - 4096;
 
     // 1. Get all variables currently free in the environment
     let env_fv: HashSet<u64> = env
         .values()
         .flat_map(|s| {
-            let fv = free_vars(&s.ty);
+            let mut fv = free_vars(&s.ty);
+            fv.extend(free_vars_preds(&s.preds));
             let bound: HashSet<u64> = s.vars.iter().cloned().collect();
             // We need to collect the difference immediately to avoid reference errors
             fv.into_iter()
@@ -562,7 +732,8 @@ fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
         .collect();
 
     // 2. Get variables in the current type
-    let ty_fv = free_vars(ty);
+    let mut ty_fv = free_vars(ty);
+    ty_fv.extend(free_vars_preds(preds));
 
     // 3. Any variable in the type that is NOT in the environment can be generalized
     let mut vars: Vec<u64> = ty_fv
@@ -577,11 +748,15 @@ fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
         .map(|(i, old)| (*old, Rc::new(Type::Var(GENERALIZED_VAR_BASE - i as u64))))
         .collect();
     let ty = apply_subst(&renumbering, ty);
+    let preds: Vec<Predicate> = preds
+        .iter()
+        .map(|pred| apply_subst_predicate(&renumbering, pred))
+        .collect();
     let vars = (0..vars.len())
         .map(|i| GENERALIZED_VAR_BASE - i as u64)
         .collect();
 
-    Scheme { vars, ty }
+    Scheme { vars, preds, ty }
 }
 
 fn is_non_expansive(expr: &Expr) -> bool {
@@ -690,6 +865,8 @@ pub struct TypeChecker {
     variant_constructors: HashMap<String, Vec<String>>,
     /// Maps record type name -> field names in declaration order.
     record_fields: HashMap<String, Vec<String>>,
+    /// Field label -> record names that define that field.
+    field_instances: HashMap<String, Vec<String>>,
     /// Maps record type name -> number of type parameters.
     record_param_arity: HashMap<String, usize>,
     /// Maps value/function name → (file_id, definition span) for error reporting.
@@ -707,6 +884,7 @@ impl TypeChecker {
             type_def_spans: HashMap::new(),
             variant_constructors: HashMap::new(),
             record_fields: HashMap::new(),
+            field_instances: HashMap::new(),
             record_param_arity: HashMap::new(),
             value_def_spans: HashMap::new(),
             expr_types: Vec::new(),
@@ -735,11 +913,174 @@ impl TypeChecker {
                     params,
                     ..
                 } => {
-                    self.record_fields.insert(
+                    self.register_record_type_info(
                         name.clone(),
                         fields.iter().map(|(field, _)| field.clone()).collect(),
+                        params.len(),
                     );
-                    self.record_param_arity.insert(name.clone(), params.len());
+                }
+            }
+        }
+    }
+
+    fn register_record_type_info(&mut self, name: String, fields: Vec<String>, arity: usize) {
+        self.record_fields.insert(name.clone(), fields.clone());
+        self.record_param_arity.insert(name.clone(), arity);
+        for field in fields {
+            let entry = self.field_instances.entry(field).or_default();
+            if !entry.iter().any(|existing| existing == &name) {
+                entry.push(name.clone());
+                entry.sort();
+            }
+        }
+    }
+
+    fn field_instance_candidates(&self, label: &str) -> Vec<String> {
+        self.field_instances.get(label).cloned().unwrap_or_default()
+    }
+
+    fn solve_has_field_against_record(
+        &mut self,
+        env: &TypeEnv,
+        label: &str,
+        record_name: &str,
+        record_ty: &Rc<Type>,
+        field_ty: &Rc<Type>,
+    ) -> Result<Substitution, TypeError> {
+        let accessor_scheme = lookup_record_accessor(env, record_name, label).ok_or_else(|| {
+            TypeError::UnsatisfiedFieldConstraint {
+                field: label.to_string(),
+                record_ty: record_ty.clone(),
+                field_ty: field_ty.clone(),
+                candidates: self.field_instance_candidates(label),
+            }
+        })?;
+        let accessor_ty = self.instantiate(accessor_scheme);
+        match accessor_ty.as_ref() {
+            Type::Fun(accessor_record_ty, accessor_field_ty) => {
+                let s1 = unify(accessor_record_ty, record_ty)?;
+                let s2 = unify(
+                    &apply_subst(&s1, accessor_field_ty),
+                    &apply_subst(&s1, field_ty),
+                )?;
+                Ok(compose_subst(&s2, &s1))
+            }
+            _ => unreachable!("record accessor must be a unary function"),
+        }
+    }
+
+    fn solve_predicates(
+        &mut self,
+        env: &TypeEnv,
+        preds: &[Predicate],
+    ) -> Result<(Substitution, Vec<Predicate>), TypeError> {
+        let mut subst = HashMap::new();
+        let mut residual = vec![];
+
+        for pred in preds {
+            let pred = apply_subst_predicate(&subst, pred);
+            match pred {
+                Predicate::HasField {
+                    label,
+                    record_ty,
+                    field_ty,
+                } => {
+                    let candidates = self.field_instance_candidates(&label);
+                    match record_ty.as_ref() {
+                        Type::Con(record_name, _) => {
+                            if !candidates.is_empty()
+                                && !candidates.iter().any(|candidate| candidate == record_name)
+                            {
+                                return Err(TypeError::UnsatisfiedFieldConstraint {
+                                    field: label,
+                                    record_ty,
+                                    field_ty,
+                                    candidates,
+                                });
+                            }
+                            let s = self
+                                .solve_has_field_against_record(
+                                    env,
+                                    &label,
+                                    record_name,
+                                    &record_ty,
+                                    &field_ty,
+                                )
+                                .map_err(|_| TypeError::UnsatisfiedFieldConstraint {
+                                    field: label,
+                                    record_ty: record_ty.clone(),
+                                    field_ty: field_ty.clone(),
+                                    candidates: candidates.clone(),
+                                })?;
+                            subst = compose_subst(&s, &subst);
+                            residual = apply_subst_preds(&s, &residual);
+                        }
+                        Type::Fun(_, _) => {
+                            return Err(TypeError::UnsatisfiedFieldConstraint {
+                                field: label,
+                                record_ty,
+                                field_ty,
+                                candidates,
+                            });
+                        }
+                        Type::Var(_) => match candidates.as_slice() {
+                            [] => {
+                                return Err(TypeError::UnsatisfiedFieldConstraint {
+                                    field: label,
+                                    record_ty,
+                                    field_ty,
+                                    candidates,
+                                });
+                            }
+                            [record_name] => {
+                                let s = self.solve_has_field_against_record(
+                                    env,
+                                    &label,
+                                    record_name,
+                                    &record_ty,
+                                    &field_ty,
+                                )?;
+                                subst = compose_subst(&s, &subst);
+                                residual = apply_subst_preds(&s, &residual);
+                            }
+                            _ => {
+                                residual.push(Predicate::HasField {
+                                    label,
+                                    record_ty,
+                                    field_ty,
+                                });
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        Ok((subst, residual))
+    }
+
+    fn unresolved_predicate_error(&self, pred: &Predicate) -> TypeError {
+        match pred {
+            Predicate::HasField {
+                label,
+                record_ty,
+                field_ty,
+            } => {
+                let candidates = self.field_instance_candidates(label);
+                if candidates.len() > 1 {
+                    TypeError::AmbiguousFieldConstraint {
+                        field: label.clone(),
+                        record_ty: record_ty.clone(),
+                        field_ty: field_ty.clone(),
+                        candidates,
+                    }
+                } else {
+                    TypeError::UnsatisfiedFieldConstraint {
+                        field: label.clone(),
+                        record_ty: record_ty.clone(),
+                        field_ty: field_ty.clone(),
+                        candidates,
+                    }
                 }
             }
         }
@@ -751,9 +1092,19 @@ impl TypeChecker {
         Rc::new(Type::Var(id))
     }
 
-    fn instantiate(&mut self, scheme: &Scheme) -> Rc<Type> {
+    fn instantiate_with_preds(&mut self, scheme: &Scheme) -> (Rc<Type>, Vec<Predicate>) {
         let subst: Substitution = scheme.vars.iter().map(|&v| (v, self.fresh())).collect();
-        apply_subst(&subst, &scheme.ty)
+        let ty = apply_subst(&subst, &scheme.ty);
+        let preds = scheme
+            .preds
+            .iter()
+            .map(|pred| apply_subst_predicate(&subst, pred))
+            .collect();
+        (ty, preds)
+    }
+
+    fn instantiate(&mut self, scheme: &Scheme) -> Rc<Type> {
+        self.instantiate_with_preds(scheme).0
     }
 
     fn record_expr_type(&mut self, span: std::ops::Range<usize>, ty: Rc<Type>) {
@@ -931,6 +1282,18 @@ impl TypeChecker {
         &self.expr_types
     }
 
+    pub fn inferred_record_expr_types(&self) -> HashMap<(usize, usize), String> {
+        let mut out = HashMap::new();
+        for (span, ty) in &self.expr_types {
+            if let Type::Con(name, _) = ty.as_ref()
+                && self.record_fields.contains_key(name)
+            {
+                out.insert((span.start, span.end), name.clone());
+            }
+        }
+        out
+    }
+
     fn apply_expr_type_subst(&mut self, subst: &Substitution) {
         for (_, ty) in &mut self.expr_types {
             *ty = apply_subst(subst, ty);
@@ -941,7 +1304,7 @@ impl TypeChecker {
         &mut self,
         env: &TypeEnv,
         expr: &Expr,
-    ) -> Result<(Substitution, Rc<Type>), TypeError> {
+    ) -> Result<(Substitution, Rc<Type>, Vec<Predicate>), TypeError> {
         match expr {
             Expr::Literal(lit, _) => {
                 let ty = match lit {
@@ -952,50 +1315,59 @@ impl TypeChecker {
                     Literal::Unit => Type::unit(),
                 };
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((HashMap::new(), ty))
+                Ok((HashMap::new(), ty, vec![]))
             }
 
             Expr::Variable(name, span) => {
                 let scheme = env
                     .get(name)
                     .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
-                let ty = self.instantiate(scheme);
+                let (ty, preds) = self.instantiate_with_preds(scheme);
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((HashMap::new(), ty))
+                Ok((HashMap::new(), ty, preds))
             }
 
             Expr::List(items, _) => {
                 let elem_ty = self.fresh();
                 let mut subst = HashMap::new();
+                let mut preds = vec![];
                 for item in items {
-                    let (s, t) = self.infer(&apply_subst_env(&subst, env), item)?;
+                    let (s, t, item_preds) = self.infer(&apply_subst_env(&subst, env), item)?;
                     // Apply both accumulated subst and item subst so the
                     // constrained elem_ty is visible when unifying the next item.
                     let known_elem = apply_subst(&compose_subst(&s, &subst), &elem_ty);
                     let s_unify =
                         unify(&known_elem, &t).map_err(|e| mismatch_with_span(e, item.span()))?;
+                    preds = apply_subst_preds(&s, &preds);
+                    preds.extend(item_preds);
+                    preds = apply_subst_preds(&s_unify, &preds);
                     subst = compose_subst(&compose_subst(&s_unify, &s), &subst);
                 }
                 let ty = Type::array(apply_subst(&subst, &elem_ty));
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((subst.clone(), ty))
+                Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
             }
 
             Expr::If {
                 cond, then, els, ..
             } => {
-                let (s1, t_cond) = self.infer(env, cond)?;
+                let (s1, t_cond, cond_preds) = self.infer(env, cond)?;
                 let s_bool =
                     unify(&t_cond, &Type::bool()).map_err(|_| TypeError::ConditionNotBool {
                         found: t_cond.clone(),
                     })?;
                 let s1 = compose_subst(&s_bool, &s1);
+                let mut preds = apply_subst_preds(&s_bool, &cond_preds);
 
-                let (s2, t_then) = self.infer(&apply_subst_env(&s1, env), then)?;
+                let (s2, t_then, then_preds) = self.infer(&apply_subst_env(&s1, env), then)?;
                 let s12 = compose_subst(&s2, &s1);
+                preds = apply_subst_preds(&s2, &preds);
+                preds.extend(then_preds);
 
-                let (s3, t_els) = self.infer(&apply_subst_env(&s12, env), els)?;
+                let (s3, t_els, else_preds) = self.infer(&apply_subst_env(&s12, env), els)?;
                 let s123 = compose_subst(&s3, &s12);
+                preds = apply_subst_preds(&s3, &preds);
+                preds.extend(else_preds);
 
                 let then_resolved = apply_subst(&s123, &t_then);
                 let else_resolved = apply_subst(&s123, &t_els);
@@ -1006,9 +1378,10 @@ impl TypeChecker {
                     }
                 })?;
                 let s_res = compose_subst(&s_final, &s123);
+                preds = apply_subst_preds(&s_final, &preds);
                 let ty = apply_subst(&s_res, &t_then);
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((s_res.clone(), ty))
+                Ok((s_res.clone(), ty, apply_subst_preds(&s_res, &preds)))
             }
 
             Expr::Call {
@@ -1025,7 +1398,7 @@ impl TypeChecker {
                     } else {
                         (None, None, None, None)
                     };
-                let (s0, mut t_func) = self.infer(env, func)?;
+                let (s0, mut t_func, mut preds) = self.infer(env, func)?;
                 let mut subst = s0;
                 let mut prev_span: Option<std::ops::Range<usize>> = None;
 
@@ -1054,14 +1427,22 @@ impl TypeChecker {
                         },
                     )?;
                     subst = compose_subst(&s_unify, &subst);
+                    preds = apply_subst_preds(&s_unify, &preds);
+                    let (s_pred, solved_preds) =
+                        self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                    subst = compose_subst(&s_pred, &subst);
+                    preds = apply_subst_preds(&s_pred, &solved_preds);
                     let result_ty = apply_subst(&subst, &ret);
                     self.record_expr_type(expr.span(), result_ty.clone());
-                    return Ok((subst, result_ty));
+                    return Ok((subst.clone(), result_ty, apply_subst_preds(&subst, &preds)));
                 }
 
                 for arg in args {
-                    let (s_arg, t_arg) = self.infer(&apply_subst_env(&subst, env), arg)?;
+                    let (s_arg, t_arg, arg_preds) =
+                        self.infer(&apply_subst_env(&subst, env), arg)?;
                     subst = compose_subst(&s_arg, &subst);
+                    preds = apply_subst_preds(&s_arg, &preds);
+                    preds.extend(arg_preds);
                     t_func = apply_subst(&subst, &t_func);
 
                     let ret = self.fresh();
@@ -1094,11 +1475,17 @@ impl TypeChecker {
                             other => other,
                         })?;
                     subst = compose_subst(&s_unify, &subst);
+                    preds = apply_subst_preds(&s_unify, &preds);
                     t_func = apply_subst(&subst, &ret);
                     prev_span = Some(arg.span());
                 }
+                let (s_pred, solved_preds) =
+                    self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                subst = compose_subst(&s_pred, &subst);
+                preds = apply_subst_preds(&s_pred, &solved_preds);
+                t_func = apply_subst(&s_pred, &t_func);
                 self.record_expr_type(expr.span(), t_func.clone());
-                Ok((subst, t_func))
+                Ok((subst.clone(), t_func, apply_subst_preds(&subst, &preds)))
             }
 
             // Named function definition — always self-recursive in Mond.
@@ -1127,6 +1514,7 @@ impl TypeChecker {
                         arg.clone(),
                         Scheme {
                             vars: vec![],
+                            preds: vec![],
                             ty: ty.clone(),
                         },
                     );
@@ -1137,14 +1525,20 @@ impl TypeChecker {
                     name.clone(),
                     Scheme {
                         vars: vec![],
+                        preds: vec![],
                         ty: fun_ty.clone(),
                     },
                 );
 
-                let (s1, t_val) = self.infer(&inner_env, value)?;
+                let (s1, t_val, value_preds) = self.infer(&inner_env, value)?;
                 let s2 = unify(&apply_subst(&s1, &ret_ty), &t_val)
                     .map_err(|e| mismatch_with_span(e, value.span()))?;
-                let s12 = compose_subst(&s2, &s1);
+                let mut s12 = compose_subst(&s2, &s1);
+                let preds = apply_subst_preds(&s2, &value_preds);
+                let (s_pred, preds) =
+                    self.solve_predicates(&apply_subst_env(&s12, &inner_env), &preds)?;
+                s12 = compose_subst(&s_pred, &s12);
+                let preds = apply_subst_preds(&s_pred, &preds);
 
                 for (span, ty) in arg_spans.iter().zip(arg_tys.iter()) {
                     self.record_expr_type(span.clone(), apply_subst(&s12, ty));
@@ -1153,7 +1547,7 @@ impl TypeChecker {
                 let binding_ty = apply_subst(&s12, &fun_ty);
                 self.record_expr_type(name_span.clone(), binding_ty.clone());
                 self.record_expr_type(expr.span(), binding_ty.clone());
-                Ok((s12, binding_ty))
+                Ok((s12.clone(), binding_ty, apply_subst_preds(&s12, &preds)))
             }
 
             // Sequential local binding — (let [x val] body).
@@ -1165,31 +1559,47 @@ impl TypeChecker {
                 body,
                 ..
             } => {
-                let (s1, t_val) = self.infer(env, value)?;
-                let ty = apply_subst(&s1, &t_val);
+                let (s1, t_val, value_preds) = self.infer(env, value)?;
+                let mut s1 = s1;
+                let mut value_preds = apply_subst_preds(&s1, &value_preds);
+                let mut ty = apply_subst(&s1, &t_val);
+                let (s_pred, solved_preds) =
+                    self.solve_predicates(&apply_subst_env(&s1, env), &value_preds)?;
+                s1 = compose_subst(&s_pred, &s1);
+                value_preds = apply_subst_preds(&s_pred, &solved_preds);
+                ty = apply_subst(&s_pred, &ty);
                 self.record_expr_type(name_span.clone(), ty.clone());
                 let scheme = if is_non_expansive(value) {
-                    generalize(&apply_subst_env(&s1, env), &ty)
+                    generalize(&apply_subst_env(&s1, env), &ty, &value_preds)
                 } else {
-                    Scheme { vars: vec![], ty }
+                    Scheme {
+                        vars: vec![],
+                        preds: value_preds.clone(),
+                        ty,
+                    }
                 };
 
                 let mut body_env = apply_subst_env(&s1, env);
                 body_env.insert(name.clone(), scheme);
-                let (s2, t_body) = self.infer(&body_env, body)?;
+                let (s2, t_body, body_preds) = self.infer(&body_env, body)?;
 
                 let subst = compose_subst(&s2, &s1);
+                let mut preds = apply_subst_preds(&s2, &value_preds);
+                preds.extend(body_preds);
                 let ty = apply_subst(&subst, &t_body);
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((subst, ty))
+                Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
             }
 
             Expr::Match { targets, arms, .. } => {
                 let mut subst = HashMap::new();
                 let mut target_types = Vec::new();
+                let mut preds = vec![];
                 for target in targets {
-                    let (s, t) = self.infer(env, target)?;
+                    let (s, t, target_preds) = self.infer(env, target)?;
                     subst = compose_subst(&s, &subst);
+                    preds = apply_subst_preds(&s, &preds);
+                    preds.extend(target_preds);
                     target_types.push(t);
                 }
 
@@ -1208,8 +1618,11 @@ impl TypeChecker {
                     // so pattern-bound variables have their concrete types visible.
                     // Without this, `val` in `(Some val) ~> body` would be Var(?n)
                     // rather than the type inferred from the match target.
-                    let (s_body, t_body) = self.infer(&apply_subst_env(&subst, &pat_env), body)?;
+                    let (s_body, t_body, body_preds) =
+                        self.infer(&apply_subst_env(&subst, &pat_env), body)?;
                     subst = compose_subst(&s_body, &subst);
+                    preds = apply_subst_preds(&s_body, &preds);
+                    preds.extend(body_preds);
 
                     let expected = apply_subst(&subst, &result_ty);
                     let found = apply_subst(&subst, &t_body);
@@ -1219,6 +1632,7 @@ impl TypeChecker {
                         found: found.clone(),
                     })?;
                     subst = compose_subst(&s_unify, &subst);
+                    preds = apply_subst_preds(&s_unify, &preds);
 
                     for pat in pats {
                         self.record_pattern_binding_types(pat, &subst, &pat_env);
@@ -1227,7 +1641,7 @@ impl TypeChecker {
                 self.ensure_match_exhaustive(&subst, &target_types, arms)?;
                 let ty = apply_subst(&subst, &result_ty);
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((subst.clone(), ty))
+                Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
             }
 
             Expr::FieldAccess {
@@ -1237,94 +1651,74 @@ impl TypeChecker {
             } => {
                 // Infer the record type first so we can name it in the error if the field
                 // doesn't exist.
-                let (s1, t_record) = self.infer(env, record)?;
+                let (s1, t_record, record_preds) = self.infer(env, record)?;
 
                 let resolved_record = apply_subst(&s1, &t_record);
-                let scheme = if let Type::Con(record_name, _) = resolved_record.as_ref() {
-                    if let Some(layout) = self.record_fields.get(record_name) {
-                        if !layout.iter().any(|declared| declared == field) {
-                            return Err(TypeError::UnknownField {
-                                field: field.clone(),
-                                record_ty: resolved_record.clone(),
-                                field_span: span.clone(),
-                                def: self.type_def_spans.get(record_name).cloned(),
-                            });
-                        }
-                        lookup_record_accessor(env, record_name, field).ok_or_else(|| {
-                            TypeError::UnknownField {
-                                field: field.clone(),
-                                record_ty: resolved_record.clone(),
-                                field_span: span.clone(),
-                                def: self.type_def_spans.get(record_name).cloned(),
-                            }
-                        })?
-                    } else {
-                        let accessor_name = format!(":{field}");
-                        env.get(&accessor_name)
-                            .ok_or_else(|| TypeError::UnknownField {
-                                field: field.clone(),
-                                record_ty: resolved_record.clone(),
-                                field_span: span.clone(),
-                                def: self.type_def_spans.get(record_name).cloned(),
-                            })?
+                let mut candidates = self.field_instance_candidates(field);
+                candidates.sort();
+
+                if let Type::Con(record_name, _) = resolved_record.as_ref() {
+                    let has_local_layout = self.record_fields.contains_key(record_name);
+                    if has_local_layout
+                        && !candidates.iter().any(|candidate| candidate == record_name)
+                    {
+                        return Err(TypeError::UnknownField {
+                            field: field.clone(),
+                            record_ty: resolved_record.clone(),
+                            field_span: span.clone(),
+                            def: self.type_def_spans.get(record_name).cloned(),
+                        });
                     }
-                } else {
-                    // When the record type is not yet known, only use a plain accessor if it is
-                    // unambiguous across all known records. Otherwise we may incorrectly lock onto
-                    // whichever declaration happened to be seen first.
-                    let mut candidates: Vec<String> = self
-                        .record_fields
-                        .iter()
-                        .filter_map(|(name, fields)| {
-                            if fields.iter().any(|declared| declared == field) {
-                                Some(name.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    candidates.sort();
-                    match candidates.as_slice() {
-                        [] => {
-                            let accessor_name = format!(":{field}");
-                            env.get(&accessor_name)
-                                .ok_or_else(|| TypeError::UnknownField {
-                                    field: field.clone(),
-                                    record_ty: resolved_record.clone(),
-                                    field_span: span.clone(),
-                                    def: None,
-                                })?
+
+                    let scheme = lookup_record_accessor(env, record_name, field).or_else(|| {
+                        if has_local_layout {
+                            None
+                        } else {
+                            env.get(&format!(":{field}"))
                         }
-                        [record_name] => lookup_record_accessor(env, record_name, field)
-                            .ok_or_else(|| TypeError::UnknownField {
-                                field: field.clone(),
-                                record_ty: resolved_record.clone(),
-                                field_span: span.clone(),
-                                def: self.type_def_spans.get(record_name).cloned(),
-                            })?,
-                        _ => {
-                            return Err(TypeError::AmbiguousFieldAccess {
-                                field: field.clone(),
-                                record_ty: resolved_record.clone(),
-                                field_span: span.clone(),
-                                candidates,
-                            });
-                        }
+                    });
+                    if let Some(scheme) = scheme {
+                        let (accessor_ty, accessor_preds) = self.instantiate_with_preds(scheme);
+
+                        let ret_ty = self.fresh();
+                        let s2 = unify(
+                            &apply_subst(&s1, &accessor_ty),
+                            &Type::fun(t_record.clone(), ret_ty.clone()),
+                        )
+                        .map_err(|e| mismatch_with_span(e, record.span()))?;
+                        let s12 = compose_subst(&s2, &s1);
+                        let mut preds = apply_subst_preds(&s2, &record_preds);
+                        preds.extend(apply_subst_preds(&s2, &accessor_preds));
+                        preds.push(Predicate::HasField {
+                            label: field.clone(),
+                            record_ty: apply_subst(&s12, &t_record),
+                            field_ty: apply_subst(&s12, &ret_ty),
+                        });
+
+                        let ty = apply_subst(&s12, &ret_ty);
+                        self.record_expr_type(expr.span(), ty.clone());
+                        return Ok((s12.clone(), ty, apply_subst_preds(&s12, &preds)));
                     }
-                };
-                let accessor_ty = self.instantiate(scheme);
+                }
+
+                if candidates.is_empty() {
+                    return Err(TypeError::UnknownField {
+                        field: field.clone(),
+                        record_ty: resolved_record.clone(),
+                        field_span: span.clone(),
+                        def: None,
+                    });
+                }
 
                 let ret_ty = self.fresh();
-                let s2 = unify(
-                    &apply_subst(&s1, &accessor_ty),
-                    &Type::fun(t_record, ret_ty.clone()),
-                )
-                .map_err(|e| mismatch_with_span(e, record.span()))?;
-                let s12 = compose_subst(&s2, &s1);
-
-                let ty = apply_subst(&s12, &ret_ty);
-                self.record_expr_type(expr.span(), ty.clone());
-                Ok((s12.clone(), ty))
+                let mut preds = apply_subst_preds(&s1, &record_preds);
+                preds.push(Predicate::HasField {
+                    label: field.clone(),
+                    record_ty: resolved_record,
+                    field_ty: ret_ty.clone(),
+                });
+                self.record_expr_type(expr.span(), ret_ty.clone());
+                Ok((s1.clone(), ret_ty, apply_subst_preds(&s1, &preds)))
             }
 
             Expr::Lambda {
@@ -1342,6 +1736,7 @@ impl TypeChecker {
                         arg.clone(),
                         Scheme {
                             vars: vec![],
+                            preds: vec![],
                             ty: tv.clone(),
                         },
                     );
@@ -1349,7 +1744,7 @@ impl TypeChecker {
                     arg_tys.push(tv);
                 }
 
-                let (s, t_body) = self.infer(&inner_env, body)?;
+                let (s, t_body, body_preds) = self.infer(&inner_env, body)?;
 
                 // Apply substitution to arg types, then build curried Fun type
                 let ty = arg_tys
@@ -1364,7 +1759,7 @@ impl TypeChecker {
                 }
 
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((s, ty))
+                Ok((s.clone(), ty, apply_subst_preds(&s, &body_preds)))
             }
 
             Expr::RecordConstruct { name, fields, span } => {
@@ -1377,13 +1772,14 @@ impl TypeChecker {
                     let ctor_scheme = env
                         .get(name)
                         .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
-                    let mut ctor_ty = self.instantiate(ctor_scheme);
+                    let (mut ctor_ty, ctor_preds) = self.instantiate_with_preds(ctor_scheme);
                     let mut ctor_arg_tys = Vec::new();
                     while let Type::Fun(arg, ret) = ctor_ty.as_ref() {
                         ctor_arg_tys.push(arg.clone());
                         ctor_ty = ret.clone();
                     }
                     let record_ty = ctor_ty;
+                    let mut preds = ctor_preds;
 
                     let mut by_name: HashMap<String, &Expr> = HashMap::new();
                     for (field_name, value_expr) in fields {
@@ -1425,33 +1821,37 @@ impl TypeChecker {
                             .get(idx)
                             .cloned()
                             .unwrap_or_else(|| self.fresh());
-                        let (s_val, t_val) =
+                        let (s_val, t_val, value_preds) =
                             self.infer(&apply_subst_env(&subst, env), value_expr)?;
                         subst = compose_subst(&s_val, &subst);
+                        preds = apply_subst_preds(&s_val, &preds);
+                        preds.extend(value_preds);
                         let s_field = unify(
                             &apply_subst(&subst, &expected_ty),
                             &apply_subst(&subst, &t_val),
                         )
                         .map_err(|e| mismatch_with_span(e, value_span))?;
                         subst = compose_subst(&s_field, &subst);
+                        preds = apply_subst_preds(&s_field, &preds);
                     }
 
                     let ty = apply_subst(&subst, &record_ty);
                     self.record_expr_type(expr.span(), ty.clone());
-                    return Ok((subst.clone(), ty));
+                    return Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)));
                 }
 
                 // Fallback path (e.g. imported records where local layout metadata is unavailable):
                 // infer from accessors only.
                 let result_ty = self.fresh();
                 let mut subst = HashMap::new();
+                let mut preds = vec![];
 
                 for (field_name, value_expr) in fields {
                     let accessor_name = format!(":{field_name}");
                     let scheme = env.get(&accessor_name).ok_or_else(|| {
                         TypeError::UnboundVariable(accessor_name.clone(), span.clone())
                     })?;
-                    let accessor_ty = self.instantiate(scheme);
+                    let (accessor_ty, accessor_preds) = self.instantiate_with_preds(scheme);
                     let value_span = value_expr.span();
 
                     let field_ty = self.fresh();
@@ -1460,9 +1860,14 @@ impl TypeChecker {
                         &Type::fun(apply_subst(&subst, &result_ty), field_ty.clone()),
                     )?;
                     subst = compose_subst(&s_acc, &subst);
+                    preds = apply_subst_preds(&s_acc, &preds);
+                    preds.extend(apply_subst_preds(&s_acc, &accessor_preds));
 
-                    let (s_val, t_val) = self.infer(&apply_subst_env(&subst, env), value_expr)?;
+                    let (s_val, t_val, value_preds) =
+                        self.infer(&apply_subst_env(&subst, env), value_expr)?;
                     subst = compose_subst(&s_val, &subst);
+                    preds = apply_subst_preds(&s_val, &preds);
+                    preds.extend(value_preds);
 
                     let s_field = unify(
                         &apply_subst(&subst, &field_ty),
@@ -1470,11 +1875,12 @@ impl TypeChecker {
                     )
                     .map_err(|e| mismatch_with_span(e, value_span))?;
                     subst = compose_subst(&s_field, &subst);
+                    preds = apply_subst_preds(&s_field, &preds);
                 }
 
                 let ty = apply_subst(&subst, &result_ty);
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((subst.clone(), ty))
+                Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
             }
 
             Expr::RecordUpdate {
@@ -1482,8 +1888,9 @@ impl TypeChecker {
                 updates,
                 span: _,
             } => {
-                let (s_record, t_record) = self.infer(env, record)?;
+                let (s_record, t_record, record_preds) = self.infer(env, record)?;
                 let mut subst = s_record;
+                let mut preds = record_preds;
                 let resolved_record = apply_subst(&subst, &t_record);
 
                 let mut seen_fields: HashSet<String> = HashSet::new();
@@ -1537,6 +1944,7 @@ impl TypeChecker {
                         let inferred_input = Type::con(record_name.clone(), input_args);
                         let s_infer = unify(&apply_subst(&subst, &t_record), &inferred_input)?;
                         subst = compose_subst(&s_infer, &subst);
+                        preds = apply_subst_preds(&s_infer, &preds);
                         Some((
                             record_name,
                             arity,
@@ -1574,8 +1982,10 @@ impl TypeChecker {
                                     record_span.clone(),
                                 )
                             })?;
-                        let accessor_in_ty = self.instantiate(accessor_scheme);
-                        let accessor_out_ty = self.instantiate(accessor_scheme);
+                        let (accessor_in_ty, accessor_in_preds) =
+                            self.instantiate_with_preds(accessor_scheme);
+                        let (accessor_out_ty, accessor_out_preds) =
+                            self.instantiate_with_preds(accessor_scheme);
 
                         let in_field_ty = self.fresh();
                         let out_field_ty = self.fresh();
@@ -1584,6 +1994,8 @@ impl TypeChecker {
                             &Type::fun(apply_subst(&subst, &input_record_ty), in_field_ty.clone()),
                         )?;
                         subst = compose_subst(&s_in_acc, &subst);
+                        preds = apply_subst_preds(&s_in_acc, &preds);
+                        preds.extend(apply_subst_preds(&s_in_acc, &accessor_in_preds));
                         let s_out_acc = unify(
                             &apply_subst(&subst, &accessor_out_ty),
                             &Type::fun(
@@ -1592,18 +2004,28 @@ impl TypeChecker {
                             ),
                         )?;
                         subst = compose_subst(&s_out_acc, &subst);
+                        preds = apply_subst_preds(&s_out_acc, &preds);
+                        preds.extend(apply_subst_preds(&s_out_acc, &accessor_out_preds));
 
                         if let Some(value_expr) = updates_by_name.get(field_name) {
                             let value_span = value_expr.span();
-                            let (s_val, t_val) =
+                            let (s_val, t_val, value_preds) =
                                 self.infer(&apply_subst_env(&subst, env), value_expr)?;
                             subst = compose_subst(&s_val, &subst);
+                            preds = apply_subst_preds(&s_val, &preds);
+                            preds.extend(value_preds);
                             let s_field = unify(
                                 &apply_subst(&subst, &out_field_ty),
                                 &apply_subst(&subst, &t_val),
                             )
                             .map_err(|e| mismatch_with_span(e, value_span))?;
                             subst = compose_subst(&s_field, &subst);
+                            preds = apply_subst_preds(&s_field, &preds);
+                            preds.push(Predicate::HasField {
+                                label: field_name.clone(),
+                                record_ty: apply_subst(&subst, &output_record_ty),
+                                field_ty: apply_subst(&subst, &out_field_ty),
+                            });
                         } else {
                             let s_same = unify(
                                 &apply_subst(&subst, &in_field_ty),
@@ -1611,42 +2033,52 @@ impl TypeChecker {
                             )
                             .map_err(|e| mismatch_with_span(e, record_span.clone()))?;
                             subst = compose_subst(&s_same, &subst);
+                            preds = apply_subst_preds(&s_same, &preds);
                         }
                     }
 
                     let ty = apply_subst(&subst, &output_record_ty);
                     self.record_expr_type(expr.span(), ty.clone());
-                    return Ok((subst.clone(), ty));
+                    return Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)));
                 }
 
                 // Fallback for unresolved record layouts: preserve the input record type.
                 for (field_name, value_expr) in updates {
                     let value_span = value_expr.span();
-                    let accessor_name = format!(":{field_name}");
-                    let scheme = env.get(&accessor_name).ok_or_else(|| {
-                        TypeError::UnboundVariable(accessor_name.clone(), value_span.clone())
-                    })?;
-                    let accessor_ty = self.instantiate(scheme);
-                    let field_ty = self.fresh();
-                    let s_acc = unify(
-                        &apply_subst(&subst, &accessor_ty),
-                        &Type::fun(apply_subst(&subst, &t_record), field_ty.clone()),
-                    )?;
-                    subst = compose_subst(&s_acc, &subst);
+                    let candidates = self.field_instance_candidates(field_name);
+                    if candidates.is_empty() {
+                        return Err(TypeError::UnknownField {
+                            field: field_name.clone(),
+                            record_ty: apply_subst(&subst, &t_record),
+                            field_span: value_span.clone(),
+                            def: None,
+                        });
+                    }
 
-                    let (s_val, t_val) = self.infer(&apply_subst_env(&subst, env), value_expr)?;
+                    let (s_val, t_val, value_preds) =
+                        self.infer(&apply_subst_env(&subst, env), value_expr)?;
                     subst = compose_subst(&s_val, &subst);
+                    preds = apply_subst_preds(&s_val, &preds);
+                    preds.extend(value_preds);
+
+                    let field_ty = self.fresh();
                     let s_field = unify(
-                        &apply_subst(&subst, &field_ty),
                         &apply_subst(&subst, &t_val),
+                        &apply_subst(&subst, &field_ty),
                     )
                     .map_err(|e| mismatch_with_span(e, value_span))?;
                     subst = compose_subst(&s_field, &subst);
+                    preds = apply_subst_preds(&s_field, &preds);
+                    preds.push(Predicate::HasField {
+                        label: field_name.clone(),
+                        record_ty: apply_subst(&subst, &t_record),
+                        field_ty: apply_subst(&subst, &field_ty),
+                    });
                 }
 
                 let ty = apply_subst(&subst, &t_record);
                 self.record_expr_type(expr.span(), ty.clone());
-                Ok((subst.clone(), ty))
+                Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
             }
 
             // Cross-module call: look up the function's type and check all arguments.
@@ -1661,7 +2093,7 @@ impl TypeChecker {
                 let scheme = env
                     .get(&key)
                     .ok_or_else(|| TypeError::UnboundVariable(key.clone(), span.clone()))?;
-                let mut t_func = self.instantiate(scheme);
+                let (mut t_func, mut preds) = self.instantiate_with_preds(scheme);
                 let mut subst = HashMap::new();
 
                 let callee_name = format!("{module}/{function}");
@@ -1689,13 +2121,21 @@ impl TypeChecker {
                         },
                     )?;
                     subst = compose_subst(&s_unify, &subst);
+                    preds = apply_subst_preds(&s_unify, &preds);
+                    let (s_pred, solved_preds) =
+                        self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                    subst = compose_subst(&s_pred, &subst);
+                    preds = apply_subst_preds(&s_pred, &solved_preds);
                     let result_ty = apply_subst(&subst, &ret);
                     self.record_expr_type(expr.span(), result_ty.clone());
-                    return Ok((subst, result_ty));
+                    return Ok((subst.clone(), result_ty, apply_subst_preds(&subst, &preds)));
                 }
                 for arg in args {
-                    let (s_arg, t_arg) = self.infer(&apply_subst_env(&subst, env), arg)?;
+                    let (s_arg, t_arg, arg_preds) =
+                        self.infer(&apply_subst_env(&subst, env), arg)?;
                     subst = compose_subst(&s_arg, &subst);
+                    preds = apply_subst_preds(&s_arg, &preds);
+                    preds.extend(arg_preds);
                     t_func = apply_subst(&subst, &t_func);
 
                     let ret = self.fresh();
@@ -1726,12 +2166,18 @@ impl TypeChecker {
                             other => other,
                         })?;
                     subst = compose_subst(&s_unify, &subst);
+                    preds = apply_subst_preds(&s_unify, &preds);
                     prev_span = Some(arg.span());
                     t_func = apply_subst(&subst, &ret);
                 }
+                let (s_pred, solved_preds) =
+                    self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                subst = compose_subst(&s_pred, &subst);
+                preds = apply_subst_preds(&s_pred, &solved_preds);
+                t_func = apply_subst(&s_pred, &t_func);
 
                 self.record_expr_type(expr.span(), t_func.clone());
-                Ok((subst, t_func))
+                Ok((subst.clone(), t_func, apply_subst_preds(&subst, &preds)))
             }
         }
     }
@@ -1750,6 +2196,7 @@ impl TypeChecker {
                     name.clone(),
                     Scheme {
                         vars: vec![],
+                        preds: vec![],
                         ty: expected.clone(),
                     },
                 );
@@ -1960,11 +2407,11 @@ impl TypeChecker {
                         ..
                     } = type_decl
                     {
-                        self.record_fields.insert(
+                        self.register_record_type_info(
                             name.clone(),
                             fields.iter().map(|(field, _)| field.clone()).collect(),
+                            params.len(),
                         );
-                        self.record_param_arity.insert(name.clone(), params.len());
                     }
                     for (name, scheme) in
                         constructor_schemes_with_aliases(type_decl, &self.qualified_type_aliases)
@@ -1982,9 +2429,19 @@ impl TypeChecker {
                 }
                 Declaration::Expression(expr) => {
                     match self.infer(env, expr) {
-                        Ok((s, ty)) => {
+                        Ok((s, ty, preds)) => {
+                            let mut ty = ty;
+                            let mut preds = apply_subst_preds(&s, &preds);
                             self.apply_expr_type_subst(&s);
                             *env = apply_subst_env(&s, env);
+                            let (s_pred, solved_preds) = match self.solve_predicates(env, &preds) {
+                                Ok(result) => result,
+                                Err(error) => return Err(Box::new((error, expr.clone()))),
+                            };
+                            self.apply_expr_type_subst(&s_pred);
+                            *env = apply_subst_env(&s_pred, env);
+                            ty = apply_subst(&s_pred, &ty);
+                            preds = apply_subst_preds(&s_pred, &solved_preds);
                             // Named top-level functions must be available to subsequent declarations.
                             // 0-arg functions (let f {} body) are compiled as f(_Unit) -> body on
                             // the BEAM, so store them as Unit -> ReturnType in the env so that
@@ -1997,8 +2454,13 @@ impl TypeChecker {
                                 } else {
                                     ty.clone()
                                 };
-                                let scheme = generalize(env, &env_ty);
+                                let scheme = generalize(env, &env_ty, &preds);
                                 env.insert(name.clone(), scheme);
+                            } else if let Some(pred) = preds.first() {
+                                return Err(Box::new((
+                                    self.unresolved_predicate_error(pred),
+                                    expr.clone(),
+                                )));
                             }
                             last_ty = ty;
                         }
@@ -2032,10 +2494,23 @@ impl TypeChecker {
                         vec![Type::unit(), Type::string()],
                     ));
                     match self.infer(env, body) {
-                        Ok((s, ty)) => {
+                        Ok((s, ty, preds)) => {
                             self.apply_expr_type_subst(&s);
                             *env = apply_subst_env(&s, env);
-                            let ty = apply_subst(&s, &ty);
+                            let preds = apply_subst_preds(&s, &preds);
+                            let (s_pred, solved_preds) = match self.solve_predicates(env, &preds) {
+                                Ok(result) => result,
+                                Err(error) => return Err(Box::new((error, *body.clone()))),
+                            };
+                            self.apply_expr_type_subst(&s_pred);
+                            *env = apply_subst_env(&s_pred, env);
+                            if let Some(pred) = solved_preds.first() {
+                                return Err(Box::new((
+                                    self.unresolved_predicate_error(pred),
+                                    *body.clone(),
+                                )));
+                            }
+                            let ty = apply_subst(&s_pred, &apply_subst(&s, &ty));
                             if let Err(e) = unify(&ty, &expected) {
                                 return Err(Box::new((e, *body.clone())));
                             }
@@ -2068,6 +2543,7 @@ pub fn import_env(names: &[String]) -> TypeEnv {
             name.clone(),
             Scheme {
                 vars: vec![id],
+                preds: vec![],
                 ty: Rc::new(Type::Var(id)),
             },
         );
@@ -2083,6 +2559,7 @@ pub fn primitive_env() -> TypeEnv {
     // Helper to build a curried function type: t1 -> t2 -> ret
     let fun2 = |a: Rc<Type>, b: Rc<Type>, ret: Rc<Type>| Scheme {
         vars: vec![],
+        preds: vec![],
         ty: Type::fun(a, Type::fun(b, ret)),
     };
 
@@ -2115,6 +2592,7 @@ pub fn primitive_env() -> TypeEnv {
     let eq_var = u64::MAX;
     let eq_scheme = Scheme {
         vars: vec![eq_var],
+        preds: vec![],
         ty: Type::fun(
             Rc::new(Type::Var(eq_var)),
             Type::fun(Rc::new(Type::Var(eq_var)), Type::bool()),
@@ -2136,6 +2614,7 @@ pub fn primitive_env() -> TypeEnv {
         "not".to_string(),
         Scheme {
             vars: vec![],
+            preds: vec![],
             ty: Type::fun(Type::bool(), Type::bool()),
         },
     );
@@ -2217,7 +2696,11 @@ fn type_sig_to_scheme(sig: &crate::ast::TypeSig, aliases: &HashMap<String, Strin
         .collect();
     let ty = type_sig_with_vars(sig, &var_map, aliases);
     let vars = generics.iter().map(|n| var_map[n]).collect();
-    Scheme { vars, ty }
+    Scheme {
+        vars,
+        preds: vec![],
+        ty,
+    }
 }
 
 fn type_usage_to_type(
@@ -2302,6 +2785,7 @@ pub fn constructor_schemes_with_aliases(
                     con_name.clone(),
                     Scheme {
                         vars: scheme_vars.clone(),
+                        preds: vec![],
                         ty,
                     },
                 );
@@ -2342,6 +2826,7 @@ pub fn constructor_schemes_with_aliases(
                 name.clone(),
                 Scheme {
                     vars: scheme_vars.clone(),
+                    preds: vec![],
                     ty: ctor_ty,
                 },
             );
@@ -2352,6 +2837,7 @@ pub fn constructor_schemes_with_aliases(
                 let accessor_ty = Type::fun(result_ty.clone(), ft);
                 let scheme = Scheme {
                     vars: scheme_vars.clone(),
+                    preds: vec![],
                     ty: accessor_ty,
                 };
                 // Record-qualified accessor key avoids collisions when multiple
@@ -2413,6 +2899,25 @@ mod tests {
             .map_err(|err| err.0)
     }
 
+    fn check_and_env(src: &str) -> Result<TypeEnv, TypeError> {
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let mut lowerer = crate::lower::Lowerer::new();
+
+        let file_id = lowerer.add_file("test.mond".into(), src.into());
+
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse failed");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut checker = TypeChecker::new();
+        let mut env = primitive_env();
+        checker
+            .check_program(&mut env, &decls, file_id)
+            .map_err(|err| err.0)?;
+        Ok(env)
+    }
+
     fn check_expr(src: &str) -> Result<Rc<Type>, TypeError> {
         let tokens = crate::lexer::Lexer::new(src).lex();
         let mut lowerer = crate::lower::Lowerer::new();
@@ -2425,7 +2930,7 @@ mod tests {
             .expect("lowering failed");
         let mut checker = TypeChecker::new();
         let env = primitive_env();
-        checker.infer(&env, &expr).map(|(_, ty)| ty)
+        checker.infer(&env, &expr).map(|(_, ty, _)| ty)
     }
 
     #[test]
@@ -2444,6 +2949,52 @@ mod tests {
     fn type_display_keeps_parens_for_function_arguments() {
         let ty = Type::fun(Type::fun(Type::int(), Type::int()), Type::int());
         assert_eq!(type_display(&ty), "(Int -> Int) -> Int");
+    }
+
+    #[test]
+    fn predicate_display_renders_hasfield_constraint() {
+        let pred = Predicate::HasField {
+            label: "selector".to_string(),
+            record_ty: Rc::new(Type::Var(4_200)),
+            field_ty: Type::int(),
+        };
+        assert_eq!(predicate_display(&pred), "HasField :selector 'a Int");
+    }
+
+    #[test]
+    fn scheme_display_renders_qualified_types() {
+        let var = 4_200_u64;
+        let scheme = Scheme {
+            vars: vec![var],
+            preds: vec![Predicate::HasField {
+                label: "selector".to_string(),
+                record_ty: Rc::new(Type::Var(var)),
+                field_ty: Type::int(),
+            }],
+            ty: Type::fun(Rc::new(Type::Var(var)), Type::int()),
+        };
+        assert_eq!(
+            scheme_display(&scheme),
+            "HasField :selector 'a Int => 'a -> Int"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_field_constraint_diagnostic_renders_full_predicate() {
+        let err = TypeError::UnsatisfiedFieldConstraint {
+            field: "selector".to_string(),
+            record_ty: Type::con("Initialised", vec![]),
+            field_ty: Type::bool(),
+            candidates: vec!["ContinuePayload".to_string()],
+        };
+        let diags = err.to_diagnostics(0, 0..0);
+        assert!(
+            diags[0]
+                .message
+                .contains("HasField :selector Initialised Bool"),
+            "unexpected diagnostic message: {}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -2513,6 +3064,7 @@ mod tests {
             "process/new_subject".into(),
             Scheme {
                 vars: vec![subject_var],
+                preds: vec![],
                 ty: Type::con("Subject", vec![Rc::new(Type::Var(subject_var))]),
             },
         );
@@ -2520,6 +3072,7 @@ mod tests {
             "process/send".into(),
             Scheme {
                 vars: vec![subject_var],
+                preds: vec![],
                 ty: Type::fun(
                     Type::con("Subject", vec![Rc::new(Type::Var(subject_var))]),
                     Type::fun(
@@ -2902,6 +3455,171 @@ mod tests {
     }
 
     #[test]
+    fn instantiate_freshens_scheme_predicates_with_type_vars() {
+        let mut checker = TypeChecker::new();
+        let scheme_var = 9_999_u64;
+        let scheme = Scheme {
+            vars: vec![scheme_var],
+            preds: vec![Predicate::HasField {
+                label: "state".to_string(),
+                record_ty: Rc::new(Type::Var(scheme_var)),
+                field_ty: Type::int(),
+            }],
+            ty: Type::fun(Rc::new(Type::Var(scheme_var)), Type::int()),
+        };
+
+        let (ty, preds) = checker.instantiate_with_preds(&scheme);
+        let instantiated_arg = match ty.as_ref() {
+            Type::Fun(arg, _) => match arg.as_ref() {
+                Type::Var(id) => *id,
+                other => panic!("expected instantiated argument var, got {other:?}"),
+            },
+            other => panic!("expected function type, got {other:?}"),
+        };
+        let pred_record = match preds.first() {
+            Some(Predicate::HasField { record_ty, .. }) => match record_ty.as_ref() {
+                Type::Var(id) => *id,
+                other => panic!("expected predicate record var, got {other:?}"),
+            },
+            other => panic!("expected first predicate to be HasField, got {other:?}"),
+        };
+
+        assert_eq!(instantiated_arg, pred_record);
+        assert_ne!(instantiated_arg, scheme_var);
+    }
+
+    #[test]
+    fn top_level_field_access_binding_discharges_concrete_hasfield_predicate() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let get_x {p} (:x p))
+        "#;
+        let env = check_and_env(src).unwrap();
+        let scheme = env
+            .get("get_x")
+            .expect("expected `get_x` to be present in type environment");
+        assert_eq!(
+            scheme.ty,
+            Type::fun(Type::con("Point", vec![]), Type::int())
+        );
+        assert!(
+            scheme.preds.is_empty(),
+            "concrete field access should discharge HasField constraints, got {:?}",
+            scheme.preds
+        );
+    }
+
+    #[test]
+    fn top_level_record_update_binding_discharges_concrete_hasfield_predicate() {
+        let src = r#"
+            (type ['s 'r] Initialised [(:state ~ 's) (:return ~ 'r)])
+            (let returning {result initialised} (with initialised :return result))
+        "#;
+        let env = check_and_env(src).unwrap();
+        let scheme = env
+            .get("returning")
+            .expect("expected `returning` to be present in type environment");
+        assert!(
+            scheme.preds.is_empty(),
+            "concrete record update should discharge HasField constraints, got {:?}",
+            scheme.preds
+        );
+    }
+
+    #[test]
+    fn top_level_field_access_binding_retains_polymorphic_hasfield_predicate() {
+        let src = r#"
+            (type ContinuePayload [(:selector ~ Int)])
+            (type Initialised [(:selector ~ Bool)])
+            (let read_selector {x} (:selector x))
+        "#;
+        let env = check_and_env(src).unwrap();
+        let scheme = env
+            .get("read_selector")
+            .expect("expected `read_selector` to be present in type environment");
+
+        match (scheme.ty.as_ref(), scheme.preds.first()) {
+            (
+                Type::Fun(arg_ty, ret_ty),
+                Some(Predicate::HasField {
+                    label,
+                    record_ty,
+                    field_ty,
+                }),
+            ) => {
+                assert_eq!(label, "selector");
+                assert_eq!(arg_ty.as_ref(), record_ty.as_ref());
+                assert_eq!(ret_ty.as_ref(), field_ty.as_ref());
+            }
+            other => panic!("expected constrained selector accessor scheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_solves_imported_hasfield_constraint() {
+        let mut extra_env = TypeEnv::new();
+        let record_var = 11_001_u64;
+        let field_var = 11_002_u64;
+        extra_env.insert(
+            "get_state".into(),
+            Scheme {
+                vars: vec![record_var, field_var],
+                preds: vec![Predicate::HasField {
+                    label: "state".to_string(),
+                    record_ty: Rc::new(Type::Var(record_var)),
+                    field_ty: Rc::new(Type::Var(field_var)),
+                }],
+                ty: Type::fun(
+                    Rc::new(Type::Var(record_var)),
+                    Rc::new(Type::Var(field_var)),
+                ),
+            },
+        );
+
+        let src = r#"
+            (type ContinuePayload [(:state ~ Int)])
+            (let main {} (get_state (ContinuePayload :state 1)))
+        "#;
+        let ty = check_with_env(src, extra_env).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn call_reports_unsatisfied_hasfield_constraint() {
+        let mut extra_env = TypeEnv::new();
+        let record_var = 12_001_u64;
+        let field_var = 12_002_u64;
+        extra_env.insert(
+            "get_selector".into(),
+            Scheme {
+                vars: vec![record_var, field_var],
+                preds: vec![Predicate::HasField {
+                    label: "selector".to_string(),
+                    record_ty: Rc::new(Type::Var(record_var)),
+                    field_ty: Rc::new(Type::Var(field_var)),
+                }],
+                ty: Type::fun(
+                    Rc::new(Type::Var(record_var)),
+                    Rc::new(Type::Var(field_var)),
+                ),
+            },
+        );
+
+        let src = r#"
+            (type ContinuePayload [(:state ~ Int)])
+            (let main {} (get_selector (ContinuePayload :state 1)))
+        "#;
+        let err = check_with_env(src, extra_env).expect_err("expected unsatisfied HasField");
+        assert!(
+            matches!(
+                err,
+                TypeError::UnsatisfiedFieldConstraint { ref field, .. } if field == "selector"
+            ),
+            "expected UnsatisfiedFieldConstraint for :selector, got {err:?}"
+        );
+    }
+
+    #[test]
     fn infer_field_access() {
         let src = r#"
             (type Point [(:x ~ Int) (:y ~ Int)])
@@ -2924,24 +3642,15 @@ mod tests {
     }
 
     #[test]
-    fn reject_ambiguous_field_access_on_unconstrained_record() {
+    fn infer_field_access_is_disambiguated_by_callsite_record_type() {
         let src = r#"
             (type ContinuePayload [(:selector ~ Int)])
             (type Initialised [(:selector ~ Bool)])
             (let read_selector {x} (:selector x))
             (let main {} (read_selector (ContinuePayload :selector 1)))
         "#;
-        let result = check(src);
-        assert!(
-            matches!(
-                result,
-                Err(TypeError::AmbiguousFieldAccess { ref field, ref candidates, .. })
-                    if field == "selector"
-                        && candidates.contains(&"ContinuePayload".to_string())
-                        && candidates.contains(&"Initialised".to_string())
-            ),
-            "expected AmbiguousFieldAccess for :selector, got {result:?}"
-        );
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::int());
     }
 
     #[test]

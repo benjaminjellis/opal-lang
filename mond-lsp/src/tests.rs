@@ -359,6 +359,47 @@ fn unqualified_completion_includes_local_type_names() {
 }
 
 #[test]
+fn unqualified_completion_uses_curried_arrow_type_formatting() {
+    let src_modules = BTreeMap::from([(
+        "main".to_string(),
+        ModuleSource {
+            name: "main".to_string(),
+            path: PathBuf::from("src/main.mond"),
+            source: "(type ContinuePayload [(:selector ~ Int)])\n\
+                         (type Initialised [(:selector ~ Int)])\n\
+                         (let read_selector {x} (:selector x))\n\
+                         (let main {} (read_selector (ContinuePayload :selector 1)))"
+                .to_string(),
+        },
+    )]);
+    let project = Project {
+        root: None,
+        std_modules: BTreeMap::new(),
+        dep_modules: BTreeMap::new(),
+        src_modules: src_modules.clone(),
+        test_modules: BTreeMap::new(),
+        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
+            .expect("project analysis"),
+    };
+
+    let doc = project.src_modules.get("main").expect("main module");
+    let analysis = project.analyze_document(doc).expect("document analysis");
+    let offset = doc.source.len();
+    let items = project
+        .unqualified_completion_items(doc, &analysis, offset, "read")
+        .expect("completions");
+    let item = items
+        .iter()
+        .find(|item| item.label == "read_selector")
+        .expect("read_selector completion");
+    let detail = item.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("->") && !detail.contains("=>"),
+        "expected curried arrow formatting in completion detail, got {detail}"
+    );
+}
+
+#[test]
 fn record_field_completion_suggests_fields_for_constructor() {
     let src_modules = BTreeMap::from([(
         "main".to_string(),

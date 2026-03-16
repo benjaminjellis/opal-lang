@@ -410,24 +410,61 @@ fn field_access_uses_the_record_type_not_just_field_name() {
         &HashMap::new(),
     );
     assert!(
-        report.has_errors(),
-        "expected ambiguous field access to be rejected: {:?}",
+        !report.has_errors(),
+        "expected call-site type to disambiguate field access: {:?}",
         report
             .diagnostics
             .iter()
             .map(|d| d.message.clone())
             .collect::<Vec<_>>()
     );
-    let messages: Vec<String> = report
-        .diagnostics
-        .iter()
-        .map(|d| d.message.clone())
-        .collect();
+}
+
+#[test]
+fn field_access_codegen_uses_record_qualified_index_when_labels_overlap() {
+    let src = "(type ContinuePayload [(:id ~ Int) (:state ~ Int)])\n\
+               (type Initialised [(:state ~ Int)])\n\
+               (let main {} (:state (ContinuePayload :id 0 :state 1)))";
+    let output = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("compile");
     assert!(
-        messages
-            .iter()
-            .any(|m| m.contains("ambiguous field access `:state`")),
-        "expected ambiguity diagnostic for :state, got: {messages:?}"
+        output.contains("erlang:element(3"),
+        "expected ContinuePayload.:state to use tuple index 3, got:\n{output}"
+    );
+}
+
+#[test]
+fn record_update_codegen_uses_record_qualified_index_when_labels_overlap() {
+    let src = "(type ContinuePayload [(:id ~ Int) (:state ~ Int)])\n\
+               (type Initialised [(:state ~ Int)])\n\
+               (let main {} (with (ContinuePayload :id 0 :state 1) :state 2))";
+    let output = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("compile");
+    assert!(
+        output.contains("erlang:setelement(3"),
+        "expected ContinuePayload.:state update to use tuple index 3, got:\n{output}"
     );
 }
 

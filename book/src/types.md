@@ -58,3 +58,26 @@ By convention all type names are `PascalCase` identifiers.
     (let [updated_point (update_x my_point 50)]
       (io/debug updated_point))))
 ```
+
+### Field Constraints
+When multiple records share a field label (for example both have `:selector`), `Mond` now infers a field constraint instead of committing to one record too early.
+
+```mond
+(type ContinuePayload [(:selector ~ Int)])
+(type Initialised [(:selector ~ Int)])
+
+(let read_selector {x} (:selector x))
+```
+
+The inferred type for `read_selector` is shown as a qualified type:
+
+```mond
+HasField :selector 'a Int => 'a -> Int
+```
+
+This means `read_selector` works for any record type that has a `:selector` field of type `Int`.
+
+### Migration Notes
+- If you see `unsatisfied field constraint ...`, no visible record instance matches that field label/type at the call site.
+- If you see `ambiguous field constraint ...`, the value is still too polymorphic; add a concrete type constraint (for example with `match`, constructor use, or a more specific helper argument type).
+- LSP hover, completion details, and signature help now include these inferred constraints so you can see exactly what a polymorphic field helper requires.

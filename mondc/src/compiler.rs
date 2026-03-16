@@ -209,7 +209,7 @@ pub fn compile_with_imports_in_session(
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
     imported_extern_types: &[String],
-    imported_field_indices: &HashMap<String, usize>,
+    imported_field_indices: &HashMap<(String, String), usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
     let mut diagnostics = Vec::new();
@@ -475,6 +475,7 @@ pub fn compile_with_imports_in_session(
             diagnostics,
         };
     }
+    let inferred_record_expr_types = checker.inferred_record_expr_types();
 
     for (name, span) in warnings::unused_function_spans(&decls) {
         let diag = codespan_reporting::diagnostic::Diagnostic::warning()
@@ -546,7 +547,7 @@ pub fn compile_with_imports_in_session(
             ast::TypeDecl::Record { name, fields, .. } => {
                 imported_constructors.insert(name.clone(), fields.len());
                 for (i, (field_name, _)) in fields.iter().enumerate() {
-                    merged_imported_field_indices.insert(field_name.clone(), i + 2);
+                    merged_imported_field_indices.insert((name.clone(), field_name.clone()), i + 2);
                 }
                 imported_record_layouts.insert(
                     name.clone(),
@@ -562,11 +563,14 @@ pub fn compile_with_imports_in_session(
     let module = codegen::lower_module(
         module_name,
         &decls,
-        imports,
-        module_aliases,
-        imported_constructors,
-        merged_imported_field_indices,
-        imported_record_layouts,
+        codegen::LowerModuleInput {
+            imports,
+            module_aliases,
+            imported_constructors,
+            imported_field_indices: merged_imported_field_indices,
+            imported_record_layouts,
+            inferred_record_expr_types,
+        },
     );
     session::CompileReport {
         output: Some(codegen::emit_module(&module)),
@@ -585,7 +589,7 @@ pub fn compile_with_imports_report(
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
     imported_extern_types: &[String],
-    imported_field_indices: &HashMap<String, usize>,
+    imported_field_indices: &HashMap<(String, String), usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
     let mut sess = session::CompilerSession::default();
@@ -614,7 +618,7 @@ pub fn compile_with_imports(
     module_aliases: HashMap<String, String>,
     imported_type_decls: &[ast::TypeDecl],
     imported_extern_types: &[String],
-    imported_field_indices: &HashMap<String, usize>,
+    imported_field_indices: &HashMap<(String, String), usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> Option<String> {
     let report = compile_with_imports_report(

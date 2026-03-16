@@ -17,23 +17,35 @@ struct Ctx {
     imports: HashMap<String, String>,
     /// User-facing module name → Erlang module name (e.g. "io" → "mond_io")
     module_aliases: HashMap<String, String>,
-    /// Record field name → 1-based element index (tag is at 1, fields start at 2)
-    field_indices: HashMap<String, usize>,
+    /// Record/field pair → 1-based element index (tag is at 1, fields start at 2)
+    field_indices: HashMap<(String, String), usize>,
     /// Record type name -> field names in declaration order
     record_layouts: HashMap<String, Vec<String>>,
+    /// Expression span key (start, end) -> inferred record type name
+    record_expr_types: HashMap<(usize, usize), String>,
+}
+
+pub struct LowerModuleInput {
+    pub imports: HashMap<String, String>,
+    pub module_aliases: HashMap<String, String>,
+    pub imported_constructors: HashMap<String, usize>,
+    pub imported_field_indices: HashMap<(String, String), usize>,
+    pub imported_record_layouts: HashMap<String, Vec<String>>,
+    pub inferred_record_expr_types: HashMap<(usize, usize), String>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
-pub fn lower_module(
-    name: &str,
-    decls: &[ast::Declaration],
-    imports: HashMap<String, String>,
-    module_aliases: HashMap<String, String>,
-    imported_constructors: HashMap<String, usize>,
-    imported_field_indices: HashMap<String, usize>,
-    imported_record_layouts: HashMap<String, Vec<String>>,
-) -> ir::Module {
+pub fn lower_module(name: &str, decls: &[ast::Declaration], input: LowerModuleInput) -> ir::Module {
+    let LowerModuleInput {
+        imports,
+        module_aliases,
+        imported_constructors,
+        imported_field_indices,
+        imported_record_layouts,
+        inferred_record_expr_types,
+    } = input;
+
     // Pass 1: collect function names, arities, constructor arities, and record field indices
     let mut fn_names = HashSet::new();
     let mut fn_arities = HashMap::new();
@@ -67,7 +79,7 @@ pub fn lower_module(
             ast::Declaration::Type(ast::TypeDecl::Record { name, fields, .. }) => {
                 // Tag is at element(1), fields start at element(2)
                 for (i, (field_name, _)) in fields.iter().enumerate() {
-                    field_indices.insert(field_name.clone(), i + 2);
+                    field_indices.insert((name.clone(), field_name.clone()), i + 2);
                 }
                 // Records are constructors too: {record_tag, field1, field2, ...}
                 constructors.insert(name.clone(), fields.len());
@@ -92,6 +104,7 @@ pub fn lower_module(
         module_aliases,
         field_indices,
         record_layouts,
+        record_expr_types: inferred_record_expr_types,
     };
 
     // Pass 2: lower declarations to IR functions
@@ -216,6 +229,185 @@ fn lower_extern_let(
     }
 }
 
+fn span_key(span: &std::ops::Range<usize>) -> (usize, usize) {
+    (span.start, span.end)
+}
+
+fn record_name_for_expr<'a>(expr: &'a ast::Expr, ctx: &'a Ctx) -> Option<&'a str> {
+    if let Some(name) = ctx.record_expr_types.get(&span_key(&expr.span())) {
+        return Some(name.as_str());
+    }
+    match expr {
+        ast::Expr::RecordConstruct { name, .. } => Some(name.as_str()),
+        ast::Expr::RecordUpdate { record, .. } => record_name_for_expr(record, ctx),
+        _ => None,
+    }
+}
+
+fn field_index_for_record(ctx: &Ctx, record_name: &str, field_name: &str) -> Option<usize> {
+    if let Some(index) = ctx
+        .field_indices
+        .get(&(record_name.to_string(), field_name.to_string()))
+    {
+        return Some(*index);
+    }
+
+    ctx.record_layouts
+        .get(record_name)
+        .and_then(|layout| layout.iter().position(|declared| declared == field_name))
+        .map(|position| position + 2)
+}
+
+fn field_indices_for_label(ctx: &Ctx, field_name: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = ctx
+        .field_indices
+        .iter()
+        .filter_map(|((record_name, declared_field), idx)| {
+            if declared_field == field_name {
+                Some((record_name.clone(), *idx))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn dynamic_field_access(
+    field: &str,
+    record_expr: ir::Expr,
+    ctx: &Ctx,
+    fresh_idx: &mut usize,
+) -> ir::Expr {
+    let candidates = field_indices_for_label(ctx, field);
+    if candidates.is_empty() {
+        return ir::Expr::RemoteCall(
+            "erlang".into(),
+            "element".into(),
+            vec![ir::Expr::Int(2), record_expr],
+        );
+    }
+    if candidates.len() == 1 {
+        return ir::Expr::RemoteCall(
+            "erlang".into(),
+            "element".into(),
+            vec![ir::Expr::Int(candidates[0].1 as i64), record_expr],
+        );
+    }
+
+    let record_var = format!("Fld{}__", *fresh_idx);
+    *fresh_idx += 1;
+    let record_ref = ir::Expr::Var(record_var.clone());
+    let tag_expr = ir::Expr::RemoteCall(
+        "erlang".into(),
+        "element".into(),
+        vec![ir::Expr::Int(1), record_ref.clone()],
+    );
+    let mut arms: Vec<(ir::Pattern, ir::Expr)> = candidates
+        .into_iter()
+        .map(|(record_name, idx)| {
+            (
+                ir::Pattern::Atom(record_name.to_lowercase()),
+                ir::Expr::RemoteCall(
+                    "erlang".into(),
+                    "element".into(),
+                    vec![ir::Expr::Int(idx as i64), record_ref.clone()],
+                ),
+            )
+        })
+        .collect();
+    arms.push((
+        ir::Pattern::Any,
+        ir::Expr::RemoteCall(
+            "erlang".into(),
+            "error".into(),
+            vec![ir::Expr::Tuple(vec![
+                ir::Expr::Atom("badfield".into()),
+                ir::Expr::Atom(field.to_lowercase()),
+                record_ref.clone(),
+            ])],
+        ),
+    ));
+    ir::Expr::Let(
+        record_var,
+        Box::new(record_expr),
+        Box::new(ir::Expr::Case(Box::new(tag_expr), arms)),
+    )
+}
+
+fn dynamic_record_update(
+    field: &str,
+    base_record_expr: ir::Expr,
+    value_expr: ir::Expr,
+    ctx: &Ctx,
+    fresh_idx: &mut usize,
+) -> ir::Expr {
+    let candidates = field_indices_for_label(ctx, field);
+    if candidates.is_empty() {
+        return ir::Expr::RemoteCall(
+            "erlang".into(),
+            "setelement".into(),
+            vec![ir::Expr::Int(2), base_record_expr, value_expr],
+        );
+    }
+    if candidates.len() == 1 {
+        return ir::Expr::RemoteCall(
+            "erlang".into(),
+            "setelement".into(),
+            vec![
+                ir::Expr::Int(candidates[0].1 as i64),
+                base_record_expr,
+                value_expr,
+            ],
+        );
+    }
+
+    let record_var = format!("RUpdDyn{}__", *fresh_idx);
+    *fresh_idx += 1;
+    let record_ref = ir::Expr::Var(record_var.clone());
+    let tag_expr = ir::Expr::RemoteCall(
+        "erlang".into(),
+        "element".into(),
+        vec![ir::Expr::Int(1), record_ref.clone()],
+    );
+    let mut arms: Vec<(ir::Pattern, ir::Expr)> = candidates
+        .into_iter()
+        .map(|(record_name, idx)| {
+            (
+                ir::Pattern::Atom(record_name.to_lowercase()),
+                ir::Expr::RemoteCall(
+                    "erlang".into(),
+                    "setelement".into(),
+                    vec![
+                        ir::Expr::Int(idx as i64),
+                        record_ref.clone(),
+                        value_expr.clone(),
+                    ],
+                ),
+            )
+        })
+        .collect();
+    arms.push((
+        ir::Pattern::Any,
+        ir::Expr::RemoteCall(
+            "erlang".into(),
+            "error".into(),
+            vec![ir::Expr::Tuple(vec![
+                ir::Expr::Atom("badfield".into()),
+                ir::Expr::Atom(field.to_lowercase()),
+                record_ref.clone(),
+            ])],
+        ),
+    ));
+
+    ir::Expr::Let(
+        record_var,
+        Box::new(base_record_expr),
+        Box::new(ir::Expr::Case(Box::new(tag_expr), arms)),
+    )
+}
+
 // ─── Expression lowering ────────────────────────────────────────────────────
 
 fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
@@ -327,16 +519,25 @@ fn lower_expr_with_renames(
         ast::Expr::Call { func, args, .. } => lower_call(func, args, ctx, renames, fresh_idx),
 
         ast::Expr::FieldAccess { field, record, .. } => {
-            // Emit erlang:element(N, Record) where N is the 1-based field index.
-            let idx = ctx.field_indices.get(field.as_str()).copied().unwrap_or(2);
-            ir::Expr::RemoteCall(
-                "erlang".into(),
-                "element".into(),
-                vec![
-                    ir::Expr::Int(idx as i64),
+            if let Some(idx) = record_name_for_expr(record, ctx)
+                .and_then(|record_name| field_index_for_record(ctx, record_name, field))
+            {
+                ir::Expr::RemoteCall(
+                    "erlang".into(),
+                    "element".into(),
+                    vec![
+                        ir::Expr::Int(idx as i64),
+                        lower_expr_with_renames(record, ctx, renames, fresh_idx),
+                    ],
+                )
+            } else {
+                dynamic_field_access(
+                    field,
                     lower_expr_with_renames(record, ctx, renames, fresh_idx),
-                ],
-            )
+                    ctx,
+                    fresh_idx,
+                )
+            }
         }
 
         ast::Expr::RecordConstruct { name, fields, .. } => {
@@ -389,16 +590,18 @@ fn lower_expr_with_renames(
                 updates
                     .iter()
                     .fold(ir::Expr::Var(record_var.clone()), |acc, (field, value)| {
-                        let idx = ctx.field_indices.get(field.as_str()).copied().unwrap_or(2);
-                        ir::Expr::RemoteCall(
-                            "erlang".into(),
-                            "setelement".into(),
-                            vec![
-                                ir::Expr::Int(idx as i64),
-                                acc,
-                                lower_expr_with_renames(value, ctx, renames, fresh_idx),
-                            ],
-                        )
+                        let value_ir = lower_expr_with_renames(value, ctx, renames, fresh_idx);
+                        if let Some(idx) = record_name_for_expr(record, ctx)
+                            .and_then(|record_name| field_index_for_record(ctx, record_name, field))
+                        {
+                            ir::Expr::RemoteCall(
+                                "erlang".into(),
+                                "setelement".into(),
+                                vec![ir::Expr::Int(idx as i64), acc, value_ir],
+                            )
+                        } else {
+                            dynamic_record_update(field, acc, value_ir, ctx, fresh_idx)
+                        }
                     });
             ir::Expr::Let(record_var, Box::new(base_ir), Box::new(updated_ir))
         }
@@ -1135,6 +1338,52 @@ mod tests {
         assert!(
             erl.contains("erlang:setelement(2"),
             "expected record update lowering via setelement/3:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn polymorphic_field_access_lowers_to_tag_dispatch() {
+        let src = r#"
+(type ContinuePayload [(:id ~ Int) (:selector ~ Int)])
+(type Initialised [(:selector ~ Bool)])
+(let read_selector {x} (:selector x))
+(let main {} (read_selector (ContinuePayload :id 0 :selector 1)))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("case erlang:element(1, Fld"),
+            "expected tag dispatch for polymorphic field access:\n{erl}"
+        );
+        assert!(
+            erl.contains("continuepayload -> erlang:element(3"),
+            "expected ContinuePayload selector index in dispatch:\n{erl}"
+        );
+        assert!(
+            erl.contains("initialised -> erlang:element(2"),
+            "expected Initialised selector index in dispatch:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn polymorphic_record_update_lowers_to_tag_dispatch() {
+        let src = r#"
+(type ContinuePayload [(:id ~ Int) (:selector ~ Int)])
+(type Initialised [(:selector ~ Bool)])
+(let set_selector {x v} (with x :selector v))
+(let main {} (set_selector (ContinuePayload :id 0 :selector 1) 2))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("case erlang:element(1, RUpdDyn"),
+            "expected tag dispatch for polymorphic record update:\n{erl}"
+        );
+        assert!(
+            erl.contains("continuepayload -> erlang:setelement(3"),
+            "expected ContinuePayload selector update index in dispatch:\n{erl}"
+        );
+        assert!(
+            erl.contains("initialised -> erlang:setelement(2"),
+            "expected Initialised selector update index in dispatch:\n{erl}"
         );
     }
 }
