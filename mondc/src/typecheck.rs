@@ -152,6 +152,7 @@ pub enum TypeError {
     MissingRecordFields {
         record: String,
         missing: Vec<String>,
+        span: std::ops::Range<usize>,
     },
     NonExhaustiveMatch {
         missing: Vec<String>,
@@ -471,13 +472,17 @@ impl TypeError {
                             .with_message("each field may only be updated once"),
                     ]),
             ],
-            TypeError::MissingRecordFields { record, missing } => vec![
+            TypeError::MissingRecordFields {
+                record,
+                missing,
+                span: constructor_span,
+            } => vec![
                 Diagnostic::error()
                     .with_message(format!(
                         "record construction of `{record}` is missing fields"
                     ))
                     .with_labels(vec![
-                        Label::primary(file_id, span)
+                        Label::primary(file_id, constructor_span.clone())
                             .with_message("provide values for all declared record fields"),
                     ])
                     .with_notes(vec![format!("missing: {}", missing.join(", "))]),
@@ -1810,6 +1815,7 @@ impl TypeChecker {
                         return Err(TypeError::MissingRecordFields {
                             record: name.clone(),
                             missing,
+                            span: span.clone(),
                         });
                     }
 
@@ -3281,10 +3287,46 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TypeError::MissingRecordFields { ref record, ref missing })
+                Err(TypeError::MissingRecordFields {
+                    ref record,
+                    ref missing,
+                    ..
+                })
                     if record == "Point" && missing == &vec!["y".to_string()]
             ),
             "expected MissingRecordFields for Point.y, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn missing_record_fields_diagnostic_highlights_constructor_expression() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (let [x 1] (Point :x 0)))
+        "#;
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let mut lowerer = crate::lower::Lowerer::new();
+        let file_id = lowerer.add_file("test.mond".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse failed");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut checker = TypeChecker::new();
+        let mut env = primitive_env();
+        let err = checker
+            .check_program(&mut env, &decls, file_id)
+            .expect_err("expected missing field error");
+        let (type_err, top_level_expr) = *err;
+        let diags = type_err.to_diagnostics(file_id, top_level_expr.span());
+        let primary = diags[0].labels.first().expect("primary label");
+        let expected_start = src.find("(Point :x 0)").expect("constructor start");
+        let expected_end = expected_start + "(Point :x 0)".len();
+
+        assert_eq!(
+            primary.range,
+            expected_start..expected_end,
+            "missing-field diagnostic should point at the record constructor expression"
         );
     }
 
